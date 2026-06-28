@@ -13,6 +13,8 @@
 #   ./pve-update.sh --apt-only 107      # Check apt/apk for specific CTs
 #   ./pve-update.sh --host-only         # Only update the Proxmox host
 #   ./pve-update.sh --apply --no-host   # Apply to all CTs but skip the host
+#   ./pve-update.sh --install-timer          # Install weekly systemd timer (apply mode)
+#   ./pve-update.sh --install-timer daily    # Install daily systemd timer
 #
 # What it does:
 #   0. PVE host: apt update && check/apply dist-upgrade (full-upgrade)
@@ -72,6 +74,8 @@ HOST_ONLY=false        # --host-only: update only the host
 NO_HOST=false          # --no-host: skip the host
 TARGET_HOST=false      # set when 'host'/'pve' is passed as a target
 TARGET_CTS=()
+INSTALL_TIMER=false
+TIMER_SCHEDULE="weekly"
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
@@ -81,6 +85,13 @@ while [[ $# -gt 0 ]]; do
     --apt-only) APT_ONLY=true; shift ;;
     --host-only) HOST_ONLY=true; shift ;;
     --no-host)   NO_HOST=true; shift ;;
+    --install-timer)
+      INSTALL_TIMER=true
+      shift
+      if [[ "${1:-}" == "daily" || "${1:-}" == "weekly" ]]; then
+        TIMER_SCHEDULE="$1"; shift
+      fi
+      ;;
     -h|--help)
       sed -n '5,/^# =====/{ /^# =====/d; s/^# \?//p }' "$0"
       exit 0
@@ -97,6 +108,60 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# =============================================================================
+# SYSTEMD TIMER INSTALLER
+# =============================================================================
+install_timer() {
+  local schedule="$1"
+  local script_path; script_path=$(realpath "$0")
+
+  cat > /etc/systemd/system/pve-update.service <<EOF
+[Unit]
+Description=Proxmox Host + LXC Update Applier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$script_path --apply
+StandardOutput=journal
+StandardError=journal
+EOF
+
+  local on_calendar
+  case "$schedule" in
+    daily)  on_calendar="daily" ;;
+    weekly) on_calendar="weekly" ;;
+    *)
+      echo "Unknown schedule '$schedule'. Use 'daily' or 'weekly'." >&2
+      exit 1
+      ;;
+  esac
+
+  cat > /etc/systemd/system/pve-update.timer <<EOF
+[Unit]
+Description=Run pve-update $schedule
+
+[Timer]
+OnCalendar=$on_calendar
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now pve-update.timer
+  echo -e "${GREEN}✔  Timer installed (${schedule}):${NC}"
+  systemctl status pve-update.timer --no-pager -l
+}
+
+if [[ "$INSTALL_TIMER" == true ]]; then
+  install_timer "$TIMER_SCHEDULE"
+  exit 0
+fi
 
 # --- Collect running CTs ---
 mapfile -t ALL_CTS < <(pct list 2>/dev/null | awk '/running/{print $1}')
@@ -219,21 +284,29 @@ if [[ "$INCLUDE_HOST" == true ]]; then
   update_host
 fi
 
-for ctid in "${CTS[@]}"; do
-  CT_START=$(date +%s)
+# =============================================================================
+# PER-CONTAINER UPDATE LOGIC  (called in parallel — one subprocess per CT)
+# =============================================================================
+process_ct() {
+  local ctid="$1"
+  local results_file="$2"
+  local CT_START; CT_START=$(date +%s)
+  local ct_pkg=0 ct_community=0 ct_docker=0
+  local ct_error=false
 
   # Verify the CT is running
-  status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
+  local status; status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
   if [[ "$status" != "running" ]]; then
     echo -e "\n${YELLOW}⏭  CT $ctid — not running, skipping${NC}"
-    continue
+    printf '0|0|0|\n' >> "$results_file"
+    return
   fi
 
-  ct_hostname=$(pct config "$ctid" 2>/dev/null | awk '/^hostname/{print $2}')
+  local ct_hostname; ct_hostname=$(pct config "$ctid" 2>/dev/null | awk '/^hostname/{print $2}')
 
   # Detect OS and package manager — handles Alpine (ash/apk) vs Debian (bash/apt)
-  os=$(pct exec "$ctid" -- sh -c '. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME"' 2>/dev/null)
-  pkg_manager="apt"
+  local os; os=$(pct exec "$ctid" -- sh -c '. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME"' 2>/dev/null)
+  local pkg_manager="apt"
   if pct exec "$ctid" -- sh -c 'command -v apk >/dev/null 2>&1' 2>/dev/null; then
     pkg_manager="apk"
   elif ! pct exec "$ctid" -- sh -c 'command -v apt-get >/dev/null 2>&1' 2>/dev/null; then
@@ -241,7 +314,7 @@ for ctid in "${CTS[@]}"; do
   fi
 
   # Detect apps that need extra env vars to upgrade non-interactively.
-  extra_env=""
+  local extra_env=""
   if [[ "$pkg_manager" == "apt" ]] && pct exec "$ctid" -- sh -c 'command -v homebridge >/dev/null 2>&1' 2>/dev/null; then
     extra_env="UPDATE_HOMEBRIDGE_FORCE=1"
   fi
@@ -254,20 +327,20 @@ for ctid in "${CTS[@]}"; do
   # =========================================================================
   # 1. OS PACKAGE UPGRADES
   # =========================================================================
-  ct_error=false
 
   if [[ "$pkg_manager" == "apt" ]]; then
     echo -e "\n  ${CYAN}[$(timestamp)] [apt]${NC} Checking for package updates..."
     pct exec "$ctid" -- bash -c 'apt-get update -qq 2>&1' >/dev/null 2>&1
 
-    apt_upgrades=$(pct exec "$ctid" -- bash -c 'apt-get -s upgrade 2>/dev/null | grep "^Inst "' 2>/dev/null)
-    apt_count=0
+    local apt_upgrades; apt_upgrades=$(pct exec "$ctid" -- bash -c 'apt-get -s upgrade 2>/dev/null | grep "^Inst "' 2>/dev/null)
+    local apt_count=0
     [[ -n "$apt_upgrades" ]] && apt_count=$(echo "$apt_upgrades" | grep -c "^Inst")
 
     if [[ "$apt_count" -gt 0 ]]; then
-      TOTAL_PKG=$((TOTAL_PKG + apt_count))
+      ct_pkg=$((ct_pkg + apt_count))
       echo -e "  ${YELLOW}⬆  ${apt_count} package(s) upgradeable:${NC}"
       echo "$apt_upgrades" | while IFS= read -r line; do
+        local pkg old new
         pkg=$(echo "$line" | awk '{print $2}')
         old=$(echo "$line" | awk -F'[][]' '{print $2}')
         new=$(echo "$line" | awk -F'[()]' '{print $2}' | awk '{print $1}')
@@ -276,6 +349,7 @@ for ctid in "${CTS[@]}"; do
 
       if [[ "$MODE" == "apply" ]]; then
         echo -e "  ${CYAN}[$(timestamp)] [apt]${NC} Applying upgrades..."
+        local apt_output apt_exit
         apt_output=$(pct exec "$ctid" -- bash -c "DEBIAN_FRONTEND=noninteractive${extra_env:+ $extra_env} apt-get upgrade -y 2>&1")
         apt_exit=$?
         echo "$apt_output" | grep -E '^(Unpacking|Setting up|Errors|E:|Processing|Need to)' | sed "s/^/     /"
@@ -292,19 +366,19 @@ for ctid in "${CTS[@]}"; do
 
   elif [[ "$pkg_manager" == "apk" ]]; then
     echo -e "\n  ${CYAN}[$(timestamp)] [apk]${NC} Checking for package updates..."
-    apk_upgrades=$(pct exec "$ctid" -- sh -c 'apk update >/dev/null 2>&1; apk list -u 2>/dev/null' 2>/dev/null)
-    apk_count=0
+    local apk_upgrades; apk_upgrades=$(pct exec "$ctid" -- sh -c 'apk update >/dev/null 2>&1; apk list -u 2>/dev/null' 2>/dev/null)
+    local apk_count=0
     [[ -n "$apk_upgrades" ]] && apk_count=$(echo "$apk_upgrades" | grep -c '[a-z]')
 
     if [[ "$apk_count" -gt 0 ]]; then
-      TOTAL_PKG=$((TOTAL_PKG + apk_count))
+      ct_pkg=$((ct_pkg + apk_count))
       echo -e "  ${YELLOW}⬆  ${apk_count} package(s) upgradeable:${NC}"
       echo "$apk_upgrades" | sed 's/^/     /'
 
       if [[ "$MODE" == "apply" ]]; then
         echo -e "  ${CYAN}[$(timestamp)] [apk]${NC} Applying upgrades..."
         pct exec "$ctid" -- sh -c 'apk upgrade --no-cache 2>&1' | sed 's/^/     /'
-        apk_exit=${PIPESTATUS[0]}
+        local apk_exit=${PIPESTATUS[0]}
         if [[ $apk_exit -eq 0 ]]; then
           echo -e "  ${GREEN}✔  apk upgrades applied${NC}"
         else
@@ -321,26 +395,29 @@ for ctid in "${CTS[@]}"; do
   fi
 
   if [[ "$APT_ONLY" == true ]]; then
-    CT_ELAPSED=$(( $(date +%s) - CT_START ))
+    local CT_ELAPSED=$(( $(date +%s) - CT_START ))
     echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
-    continue
+    local ct_failed_entry=""
+    [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
+    printf '%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" >> "$results_file"
+    return
   fi
 
   # =========================================================================
   # 2. COMMUNITY SCRIPT UPDATE
   # =========================================================================
-  has_update=$(pct exec "$ctid" -- sh -c 'test -f /usr/bin/update && echo yes || echo no' 2>/dev/null)
+  local has_update; has_update=$(pct exec "$ctid" -- sh -c 'test -f /usr/bin/update && echo yes || echo no' 2>/dev/null)
 
   if [[ "$has_update" == "yes" ]]; then
-    TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + 1))
-    update_cmd=$(pct exec "$ctid" -- cat /usr/bin/update 2>/dev/null)
+    ct_community=$((ct_community + 1))
+    local update_cmd; update_cmd=$(pct exec "$ctid" -- cat /usr/bin/update 2>/dev/null)
     echo -e "\n  ${CYAN}[$(timestamp)] [community-script]${NC} Update mechanism found"
 
     if [[ "$MODE" == "apply" ]]; then
       echo -e "  ${CYAN}[$(timestamp)] [community-script]${NC} Running update..."
       # Write the script to a temp file to avoid shell expansion of its content,
       # then pipe 'yes' to auto-answer interactive prompts (read -p, etc.).
-      _tmp="/tmp/.pve_update_$$"
+      local _tmp="/tmp/.pve_update_$$_${ctid}"
       printf '%s\n' "$update_cmd" | pct exec "$ctid" -- bash -c "cat > $_tmp"
       yes 2>/dev/null | timeout 120 pct exec "$ctid" -- bash -c "
         export DEBIAN_FRONTEND=noninteractive
@@ -348,7 +425,7 @@ for ctid in "${CTS[@]}"; do
         ${extra_env:+export $extra_env; }
         bash $_tmp
       " 2>&1
-      community_exit=${PIPESTATUS[1]}
+      local community_exit=${PIPESTATUS[1]}
       pct exec "$ctid" -- rm -f "$_tmp" 2>/dev/null || true
       if [[ $community_exit -eq 0 ]]; then
         echo -e "  ${GREEN}✔  Community script update complete${NC}"
@@ -364,17 +441,15 @@ for ctid in "${CTS[@]}"; do
   # =========================================================================
   # 3. DOCKER IMAGE UPDATES
   # =========================================================================
-  has_docker=$(pct exec "$ctid" -- sh -c 'command -v docker >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
+  local has_docker; has_docker=$(pct exec "$ctid" -- sh -c 'command -v docker >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
 
   if [[ "$has_docker" == "yes" ]]; then
     echo -e "\n  ${CYAN}[$(timestamp)] [docker]${NC} Checking Docker containers..."
 
-    # Get running containers and their images
-    docker_info=$(pct exec "$ctid" -- docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    local docker_info; docker_info=$(pct exec "$ctid" -- docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
 
     if [[ -n "$docker_info" ]]; then
-      # Find compose files
-      compose_files=$(pct exec "$ctid" -- sh -c '
+      local compose_files; compose_files=$(pct exec "$ctid" -- sh -c '
         find /opt /root /home /srv /var -maxdepth 4 \
           \( -name "compose.yaml" -o -name "compose.yml" \
              -o -name "docker-compose.yaml" -o -name "docker-compose.yml" \) \
@@ -385,10 +460,10 @@ for ctid in "${CTS[@]}"; do
         [[ -z "$cname" ]] && continue
 
         # Determine if the tag is pinned to a specific version (X.Y.Z or vX.Y.Z)
-        tag="${cimage##*:}"
+        local tag="${cimage##*:}"
         [[ "$tag" == "$cimage" ]] && tag="latest"  # no tag = latest
 
-        is_pinned=false
+        local is_pinned=false
         if [[ "$tag" =~ ^v?[0-9]+\.[0-9]+ && "$tag" != "latest" && ! "$tag" =~ ^[0-9]+$ ]]; then
           is_pinned=true
         fi
@@ -396,25 +471,25 @@ for ctid in "${CTS[@]}"; do
         if [[ "$is_pinned" == true ]]; then
           echo -e "  ${YELLOW}📌 ${cname}${NC} — ${cimage} (pinned version)"
           echo -e "     ${YELLOW}→ Update the tag in your compose file to upgrade${NC}"
-          TOTAL_DOCKER=$((TOTAL_DOCKER + 1))
+          ct_docker=$((ct_docker + 1))
         else
           echo -e "  🐳 ${cname} — ${cimage}"
 
           if [[ "$MODE" == "apply" ]]; then
             echo -e "  ${CYAN}[$(timestamp)] [docker]${NC} Pulling ${cimage}..."
-            pull_output=$(pct exec "$ctid" -- docker pull "$cimage" 2>&1)
+            local pull_output; pull_output=$(pct exec "$ctid" -- docker pull "$cimage" 2>&1)
             echo "$pull_output" | grep -E '^(Pulling|Digest|Status)' | sed 's/^/     /'
 
             if echo "$pull_output" | grep -q "Image is up to date"; then
               echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
             else
               echo -e "  ${GREEN}⬆  New image pulled for ${cimage}${NC}"
-              TOTAL_DOCKER=$((TOTAL_DOCKER + 1))
+              ct_docker=$((ct_docker + 1))
 
               # Find the compose file that manages this container and recreate
               while IFS= read -r cf; do
                 [[ -z "$cf" ]] && continue
-                managed=$(pct exec "$ctid" -- sh -c "
+                local managed; managed=$(pct exec "$ctid" -- sh -c "
                   docker compose -f '$cf' ps --format '{{.Names}}' 2>/dev/null | grep -qxF '$cname' && echo yes || echo no
                 " 2>/dev/null)
 
@@ -441,10 +516,46 @@ for ctid in "${CTS[@]}"; do
     fi
   fi
 
-  CT_ELAPSED=$(( $(date +%s) - CT_START ))
-  [[ "$ct_error" == true ]] && FAILED_CTS+=("$ctid ($ct_hostname)")
+  local CT_ELAPSED=$(( $(date +%s) - CT_START ))
   echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
-done
+  local ct_failed_entry=""
+  [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
+  printf '%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" >> "$results_file"
+}
+
+# =============================================================================
+# 1-3. RUN CONTAINERS IN PARALLEL
+# =============================================================================
+if [[ ${#CTS[@]} -gt 0 ]]; then
+  _results=$(mktemp)
+  declare -A _pid_outfile
+  _pid_order=()
+
+  for ctid in "${CTS[@]}"; do
+    _outfile=$(mktemp)
+    process_ct "$ctid" "$_results" > "$_outfile" 2>&1 &
+    _pid=$!
+    _pid_outfile[$_pid]="$_outfile"
+    _pid_order+=("$_pid")
+  done
+
+  # Wait in submission order so CT blocks print in a predictable sequence.
+  for _pid in "${_pid_order[@]}"; do
+    wait "$_pid"
+    cat "${_pid_outfile[$_pid]}"
+    rm -f "${_pid_outfile[$_pid]}"
+  done
+  unset _pid_outfile
+
+  # Aggregate per-CT results into the global counters.
+  while IFS='|' read -r r_pkg r_comm r_docker r_failed; do
+    TOTAL_PKG=$((TOTAL_PKG + r_pkg))
+    TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
+    TOTAL_DOCKER=$((TOTAL_DOCKER + r_docker))
+    [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
+  done < "$_results"
+  rm -f "$_results"
+fi
 
 # =============================================================================
 # SUMMARY

@@ -507,8 +507,15 @@ process_ct() {
   fi
 
   # Detect apps that need extra env vars to upgrade non-interactively.
+  # homebridge-apt-pkg refuses apt upgrades whose process tree includes
+  # hb-service (its own updater runs under it) unless UPDATE_HOMEBRIDGE_FORCE=1
+  # is set. Detecting homebridge reliably under pct exec is fiddly — the
+  # 'homebridge' binary lives under the package's private node runtime and
+  # hb-service isn't consistently on PATH — so we just always set the flag on
+  # Debian/apt containers. It's a homebridge-only variable that every other
+  # package ignores, so it is harmless elsewhere.
   local extra_env=""
-  if [[ "$pkg_manager" == "apt" ]] && pct exec "$ctid" -- sh -c 'command -v homebridge >/dev/null 2>&1' 2>/dev/null; then
+  if [[ "$pkg_manager" == "apt" ]]; then
     extra_env="UPDATE_HOMEBRIDGE_FORCE=1"
   fi
 

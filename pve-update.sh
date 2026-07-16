@@ -15,6 +15,19 @@
 #   ./pve-update.sh --apply --no-host   # Apply to all CTs but skip the host
 #   ./pve-update.sh --install-timer          # Install weekly systemd timer (apply mode)
 #   ./pve-update.sh --install-timer daily    # Install daily systemd timer
+#   ./pve-update.sh --self-update            # Pull + GPG-verify the latest script
+#   ./pve-update.sh --self-update -y         # ...and skip the diff/confirm prompt
+#   ./pve-update.sh --version                # Show this script's checksum (sha256)
+#   ./pve-update.sh --no-update-check        # Skip the "new version available" check
+#
+# On interactive runs the script checks GitHub and prints a one-line notice if a
+# newer version exists — it never updates itself automatically. Run --self-update
+# to pull the new version: it downloads the script + detached signature, VERIFIES
+# the signature against the public key pinned in this script, shows a diff and
+# asks for confirmation, then does an atomic in-place replace. Re-run as usual
+# afterwards. Verification fails closed — a missing/invalid signature or missing
+# pinned key aborts without touching the installed script. The systemd timer
+# runs skip the update check entirely. See the README to set up signing.
 #
 # What it does:
 #   0. PVE host: apt update && check/apply dist-upgrade (full-upgrade)
@@ -67,6 +80,166 @@ fi
 timestamp() { date '+%H:%M:%S'; }
 SCRIPT_START=$(date +%s)
 
+# =============================================================================
+# SELF-UPDATE  (pull the latest pve-update.sh from GitHub, GPG-verified)
+# =============================================================================
+# --self-update downloads this script + its detached signature over HTTPS and
+# runs it as root. Before replacing itself it VERIFIES the download against the
+# public key pinned below (PUBKEY_B64). Because the trusted key lives in the
+# CURRENTLY-RUNNING script, a malicious push to the repo cannot rotate it — an
+# attacker would need the private signing key, which never touches the repo.
+#
+# Fail-closed: if no key is pinned, gpgv/gpg is missing, the signature is
+# missing, or verification fails, the update is refused and nothing is touched.
+# See the README "Signing releases" section to generate a key and set PUBKEY_B64.
+REPO_RAW_URL="https://raw.githubusercontent.com/H0tChicken/pve-updater/main/pve-update.sh"
+REPO_SIG_URL="${REPO_RAW_URL}.sig"
+
+# base64 of the binary GPG public keyring:  gpg --export <KEYID> | base64 | tr -d '\n'
+PUBKEY_B64="mDMEalg++RYJKwYBBAHaRw8BAQdA5CZMFIgN5yuxcSbNHyaIjJgOa+uo7Nc5+jn7DZUZREG0C1BWRSBVcGRhdGVyiK8EExYKAFcWIQSj1vxQN/5b9LRo8KDMH9eyldWoQQUCalg++RsUgAAAAAAEAA5tYW51MiwyLjUrMS4xMiwwLDMCGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AACgkQzB/XspXVqEHFhAEAiHgTkMV2iLKcbk1c7rnORhU+hVwvbe4rImPFlnY89QgA/A+t+Y9lMwvtPsiel7++ZqKklh+W/oSFLjg5439JFYQK"
+
+self_sha() { sha256sum "$(realpath "$0")" 2>/dev/null | awk '{print $1}'; }
+
+# Fetch $1 -> $2 over HTTPS only (no protocol downgrade / redirect to http/file).
+fetch_url() {
+  local url="$1" dest="$2" maxtime="${3:-20}"
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+       --connect-timeout 4 --max-time "$maxtime" "$url" -o "$dest" 2>/dev/null
+}
+fetch_remote() { fetch_url "$REPO_RAW_URL" "$1" "${2:-20}"; }
+
+# Verify file $1 against detached signature $2 using the pinned key. 0 = good.
+# Returns 2 for "can't verify" (no key / no tool) so callers can fail closed.
+verify_signature() {
+  local file="$1" sig="$2"
+  # Match the PASTE_ prefix (a glob), not the full placeholder literal: base64
+  # never contains '_', so a real pinned key can never match this, and replacing
+  # the full placeholder value can't accidentally disable the guard.
+  if [[ -z "$PUBKEY_B64" || "$PUBKEY_B64" == PASTE_* ]]; then
+    echo -e "${RED}✘  No signing key pinned (PUBKEY_B64) — refusing to self-update.${NC}" >&2
+    echo -e "     See the README 'Signing releases' section." >&2
+    return 2
+  fi
+  local keyring; keyring=$(mktemp)
+  if ! printf '%s' "$PUBKEY_B64" | base64 -d > "$keyring" 2>/dev/null; then
+    echo -e "${RED}✘  Pinned key is not valid base64 — refusing to self-update.${NC}" >&2
+    rm -f "$keyring"; return 2
+  fi
+  local rc=1
+  if command -v gpgv >/dev/null 2>&1; then
+    gpgv --keyring "$keyring" "$sig" "$file" >/dev/null 2>&1 && rc=0
+  elif command -v gpg >/dev/null 2>&1; then
+    local gh; gh=$(mktemp -d)
+    gpg --homedir "$gh" --batch --import "$keyring" >/dev/null 2>&1
+    gpg --homedir "$gh" --batch --verify "$sig" "$file" >/dev/null 2>&1 && rc=0
+    rm -rf "$gh"
+  else
+    echo -e "${RED}✘  Neither gpgv nor gpg is installed — cannot verify signature.${NC}" >&2
+    rm -f "$keyring"; return 2
+  fi
+  rm -f "$keyring"
+  return $rc
+}
+
+# Best-effort notice that GitHub has a different version. Never fails the run.
+# This only compares checksums to decide whether to PRINT a banner; it never
+# executes the download, so it needs no signature check.
+check_for_update() {
+  local tmp; tmp=$(mktemp) || return 0
+  if fetch_remote "$tmp" 6; then
+    local remote_sha local_sha
+    remote_sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+    local_sha=$(self_sha)
+    if [[ -n "$remote_sha" && -n "$local_sha" && "$remote_sha" != "$local_sha" ]]; then
+      echo ""
+      echo -e "${YELLOW}⬆  A newer version of pve-update.sh is available on GitHub.${NC}"
+      echo -e "   local ${local_sha:0:12} → remote ${remote_sha:0:12}"
+      echo -e "   Update with: ${BOLD}$0 --self-update${NC}"
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+self_update() {
+  local script_path; script_path=$(realpath "$0")
+  if [[ ! -w "$script_path" ]]; then
+    echo -e "${RED}✘  $script_path is not writable — cannot self-update.${NC}" >&2
+    exit 1
+  fi
+  # Temp files in the SAME directory so the final replace is an atomic
+  # same-filesystem rename; the running shell keeps executing the old inode.
+  local dir; dir=$(dirname "$script_path")
+  local tmp tmpsig
+  tmp=$(mktemp "$dir/.pve-update.XXXXXX")     || { echo "mktemp failed" >&2; exit 1; }
+  tmpsig=$(mktemp "$dir/.pve-update-sig.XXXXXX") || { rm -f "$tmp"; echo "mktemp failed" >&2; exit 1; }
+  # Expand the paths into the trap string NOW (double quotes): the trap fires at
+  # the script's final exit — after this function has returned on the success
+  # path — when $tmp/$tmpsig (locals) would already be out of scope. mktemp names
+  # never contain quotes, so embedding them literally is safe.
+  trap "rm -f -- '$tmp' '$tmpsig' 2>/dev/null" EXIT
+
+  echo -e "  ${CYAN}[self-update]${NC} Downloading latest from GitHub..."
+  if ! fetch_remote "$tmp"; then
+    echo -e "${RED}✘  Download failed (network down or curl missing).${NC}" >&2
+    exit 1
+  fi
+
+  # Already current? Nothing to verify or replace.
+  local old_sha new_sha
+  old_sha=$(self_sha)
+  new_sha=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+  if [[ "$old_sha" == "$new_sha" ]]; then
+    echo -e "  ${GREEN}✔  Already up to date (${old_sha:0:12}).${NC}"
+    exit 0
+  fi
+
+  # --- SECURITY GATE: verify the signature before trusting the download ---
+  echo -e "  ${CYAN}[self-update]${NC} Downloading signature..."
+  if ! fetch_url "$REPO_SIG_URL" "$tmpsig"; then
+    echo -e "${RED}✘  Could not download signature (${REPO_SIG_URL##*/}) — refusing.${NC}" >&2
+    exit 1
+  fi
+  echo -e "  ${CYAN}[self-update]${NC} Verifying signature..."
+  if ! verify_signature "$tmp" "$tmpsig"; then
+    echo -e "${RED}✘  Signature verification FAILED — not replacing.${NC}" >&2
+    exit 1
+  fi
+  echo -e "  ${GREEN}✔  Signature verified${NC}"
+
+  # Integrity checks: valid bash + looks like this script.
+  if ! bash -n "$tmp" 2>/dev/null; then
+    echo -e "${RED}✘  Downloaded file failed syntax check — not replacing.${NC}" >&2
+    exit 1
+  fi
+  if ! head -n1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q 'pve-update.sh' "$tmp"; then
+    echo -e "${RED}✘  Downloaded file doesn't look like pve-update.sh — not replacing.${NC}" >&2
+    exit 1
+  fi
+
+  # Show what's changing and get consent (interactive only).
+  if [[ -t 0 && -t 1 && "$ASSUME_YES" != true ]]; then
+    echo ""
+    echo -e "  ${BOLD}Changes to be applied:${NC}"
+    diff -u "$script_path" "$tmp" | sed 's/^/    /' || true
+    echo ""
+    local reply
+    read -r -p "  Apply this signed update? [y/N] " reply
+    if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+      echo -e "  ${YELLOW}Aborted — no changes made.${NC}"
+      exit 0
+    fi
+  fi
+
+  chmod --reference="$script_path" "$tmp" 2>/dev/null || chmod 0755 "$tmp"
+  if ! mv "$tmp" "$script_path"; then
+    echo -e "${RED}✘  Failed to replace $script_path.${NC}" >&2
+    exit 1
+  fi
+  echo -e "  ${GREEN}✔  Updated ${old_sha:0:12} → ${new_sha:0:12}${NC}"
+  echo -e "  ${BOLD}Now re-run:${NC} $0 --apply    ${CYAN}(or your usual flags)${NC}"
+}
+
 MODE="check"
 APT_ONLY=false
 INCLUDE_HOST=true      # update the Proxmox host by default
@@ -76,6 +249,9 @@ TARGET_HOST=false      # set when 'host'/'pve' is passed as a target
 TARGET_CTS=()
 INSTALL_TIMER=false
 TIMER_SCHEDULE="weekly"
+SELF_UPDATE=false
+NO_UPDATE_CHECK=false
+ASSUME_YES=false
 
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
@@ -85,6 +261,12 @@ while [[ $# -gt 0 ]]; do
     --apt-only) APT_ONLY=true; shift ;;
     --host-only) HOST_ONLY=true; shift ;;
     --no-host)   NO_HOST=true; shift ;;
+    --self-update) SELF_UPDATE=true; shift ;;
+    --no-update-check) NO_UPDATE_CHECK=true; shift ;;
+    -y|--yes) ASSUME_YES=true; shift ;;
+    --version)
+      echo "pve-update.sh  (sha256 $(self_sha | cut -c1-12))"
+      exit 0 ;;
     --install-timer)
       INSTALL_TIMER=true
       shift
@@ -161,6 +343,17 @@ EOF
 if [[ "$INSTALL_TIMER" == true ]]; then
   install_timer "$TIMER_SCHEDULE"
   exit 0
+fi
+
+if [[ "$SELF_UPDATE" == true ]]; then
+  self_update
+  exit 0
+fi
+
+# Best-effort "new version available" notice — interactive runs only, so the
+# systemd timer's --apply runs stay quiet and don't depend on the network.
+if [[ -t 1 && "$NO_UPDATE_CHECK" != true ]]; then
+  check_for_update
 fi
 
 # --- Collect running CTs ---

@@ -23,6 +23,68 @@ curl -sO https://raw.githubusercontent.com/H0tChicken/pve-updater/main/pve-updat
 chmod +x pve-update.sh
 ```
 
+## Keeping the script up to date
+
+On any interactive run the script checks GitHub and prints a one-line notice if a
+newer version exists. It **never** updates itself automatically. To pull the
+latest version:
+
+```bash
+./pve-update.sh --self-update       # download, GPG-verify, diff+confirm, replace
+./pve-update.sh --self-update -y    # ...skip the diff/confirm prompt
+./pve-update.sh --version           # show the running script's checksum
+./pve-update.sh --no-update-check   # suppress the "new version" check for one run
+```
+
+`--self-update` downloads the script **and a detached GPG signature**, verifies
+the signature against a public key pinned inside the running script, shows a diff
+and asks for confirmation, then does an atomic in-place replace. It **fails
+closed**: a missing/invalid signature, the wrong key, a missing pinned key, or a
+failed syntax check all abort without touching the installed file. Downloads are
+HTTPS-only (no protocol downgrade). The systemd timer runs skip the check
+entirely, so scheduled updates never depend on the network.
+
+Because the trusted key lives in the *currently-running* script, a malicious push
+to the GitHub repo cannot rotate it — an attacker would need your private signing
+key, which never touches the repo or the hypervisor. This is the one protection
+that actually defends against repo/token compromise (checksums in the same repo
+do not — an attacker who can push code can update them too).
+
+### Signing releases (required for `--self-update`)
+
+`--self-update` refuses to run until you complete this one-time setup. Verification
+uses `gpgv`, which is already installed on every Proxmox host.
+
+**1. Generate a signing key** (once, on a machine you control — not the hypervisor):
+
+```bash
+gpg --quick-generate-key "PVE Updater" ed25519 sign never
+FPR=$(gpg --list-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+```
+
+Keep the **private** key safe and off the repo.
+
+**2. Pin the public key** in `pve-update.sh` — replace the `PUBKEY_B64` placeholder
+with the output of:
+
+```bash
+gpg --export "$FPR" | base64 | tr -d '\n'
+```
+
+**3. Sign and commit** after every change to the script (pin the key *before*
+signing — the embedded key is part of what gets signed):
+
+```bash
+./sign-release.sh    # -> pve-update.sh.sig   (export SIGN_KEY=$FPR to pick a key)
+git add pve-update.sh pve-update.sh.sig
+git commit -m "Release" && git push
+```
+
+> First-time note: existing installs still carry the placeholder key, so
+> `--self-update` on them will refuse until you `curl` down one fresh copy that
+> has your real key pinned (see [Install](#install)). After that, `--self-update`
+> takes over and every future update is signature-checked.
+
 ## Usage
 
 ```bash
@@ -34,6 +96,7 @@ chmod +x pve-update.sh
 ./pve-update.sh --host-only --apply   # PVE host only
 ./pve-update.sh --apt-only --apply    # OS packages only (skip community scripts + Docker)
 ./pve-update.sh --apply --no-host     # All CTs, skip PVE host
+./pve-update.sh --self-update         # Update this script from GitHub
 ```
 
 ## Automatic updates (systemd timer)

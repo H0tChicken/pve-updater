@@ -419,20 +419,29 @@ process_ct() {
       # then pipe 'yes' to auto-answer interactive prompts (read -p, etc.).
       local _tmp="/tmp/.pve_update_$$_${ctid}"
       printf '%s\n' "$update_cmd" | pct exec "$ctid" -- bash -c "cat > $_tmp"
+      # CI=true / NPM_CONFIG_YES tell Node package managers (pnpm/npm) they're
+      # non-interactive, so they skip TTY-gated prompts that 'yes |' can't answer.
+      # tee streams the output live AND keeps a copy so we can replay the tail on
+      # failure. Real pipeline (not $( )), so PIPESTATUS[1] is the timeout/pct exit.
+      local _clog="/tmp/.pve_clog_$$_${ctid}"
       yes 2>/dev/null | timeout 120 pct exec "$ctid" -- bash -c "
         export DEBIAN_FRONTEND=noninteractive
         export TERM=xterm
+        export CI=true
+        export NPM_CONFIG_YES=true
         ${extra_env:+export $extra_env; }
         bash $_tmp
-      " 2>&1
+      " 2>&1 | tee "$_clog"
       local community_exit=${PIPESTATUS[1]}
       pct exec "$ctid" -- rm -f "$_tmp" 2>/dev/null || true
       if [[ $community_exit -eq 0 ]]; then
         echo -e "  ${GREEN}✔  Community script update complete${NC}"
       else
-        echo -e "  ${RED}✘  Community script failed (exit $community_exit)${NC}"
+        echo -e "  ${RED}✘  Community script failed (exit $community_exit) — last output:${NC}"
+        tail -20 "$_clog" 2>/dev/null | sed 's/^/     /'
         ct_error=true
       fi
+      rm -f "$_clog" 2>/dev/null || true
     else
       echo -e "  ${YELLOW}→  Run with --apply to execute community-script update${NC}"
     fi

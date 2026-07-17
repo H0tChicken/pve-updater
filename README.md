@@ -96,8 +96,15 @@ git commit -m "Release" && git push
 ./pve-update.sh --host-only --apply   # PVE host only
 ./pve-update.sh --apt-only --apply    # OS packages only (skip community scripts + Docker)
 ./pve-update.sh --apply --no-host     # All CTs, skip PVE host
+./pve-update.sh --apply -y            # Apply without the confirm prompt
 ./pve-update.sh --self-update         # Update this script from GitHub
 ```
+
+When you run `--apply` in a terminal, the script first previews what's available
+(a check pass over the same targets) and asks **`Apply these updates now? [y/N]`**
+before changing anything — answer `n` and nothing is touched. Pass `-y` to skip
+the prompt. The systemd timer runs with no terminal, so it always applies
+unattended (the prompt is skipped automatically).
 
 ## Automatic updates (systemd timer)
 
@@ -123,5 +130,6 @@ rm /etc/systemd/system/pve-update.{service,timer}
 
 - **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first
 - **Reboots** are never triggered automatically — the script flags when one is needed and which kernel to boot into
-- **Homebridge** containers are auto-detected and receive `UPDATE_HOMEBRIDGE_FORCE=1` so upgrades proceed non-interactively
+- **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set on all Debian/apt containers so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block unattended upgrades (the variable is ignored by every other package)
+- **Low disk space**: if a community script aborts itself because the container is low on disk, that's reported as a **skip** (not a failure) — free space (e.g. `pct resize <id> rootfs +2G`) and re-run
 - **Community scripts** are written to a temp file before execution to prevent shell injection from script content

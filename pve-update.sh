@@ -13,6 +13,7 @@
 #   ./pve-update.sh --apt-only 107      # Check apt/apk for specific CTs
 #   ./pve-update.sh --host-only         # Only update the Proxmox host
 #   ./pve-update.sh --apply --no-host   # Apply to all CTs but skip the host
+#   ./pve-update.sh --apply -y          # Apply without the confirm prompt
 #   ./pve-update.sh --install-timer          # Install weekly systemd timer (apply mode)
 #   ./pve-update.sh --install-timer daily    # Install daily systemd timer
 #   ./pve-update.sh --self-update            # Pull + GPG-verify the latest script
@@ -28,6 +29,10 @@
 # afterwards. Verification fails closed — a missing/invalid signature or missing
 # pinned key aborts without touching the installed script. The systemd timer
 # runs skip the update check entirely. See the README to set up signing.
+#
+# When you run --apply in a terminal, the script first previews what's available
+# and asks for a y/N before changing anything. Pass -y to skip the prompt. The
+# systemd timer has no terminal, so it applies unattended as before.
 #
 # What it does:
 #   0. PVE host: apt update && check/apply dist-upgrade (full-upgrade)
@@ -71,10 +76,15 @@ if ! command -v pct >/dev/null 2>&1; then
   exit 1
 fi
 
-exec 200>/var/lock/pve-update.lock
-if ! flock -n 200; then
-  echo "Error: another instance of pve-update.sh is already running." >&2
-  exit 1
+# The interactive "confirm before apply" gate re-runs this script in check mode
+# as a nested subprocess (PVE_UPDATE_NESTED=1). That child must NOT try to grab
+# the lock — the parent already holds it — or it would abort as a duplicate.
+if [[ "${PVE_UPDATE_NESTED:-}" != "1" ]]; then
+  exec 200>/var/lock/pve-update.lock
+  if ! flock -n 200; then
+    echo "Error: another instance of pve-update.sh is already running." >&2
+    exit 1
+  fi
 fi
 
 timestamp() { date '+%H:%M:%S'; }
@@ -253,6 +263,9 @@ SELF_UPDATE=false
 NO_UPDATE_CHECK=false
 ASSUME_YES=false
 
+# Capture the original invocation so the confirm gate can replay it in check mode.
+ORIG_ARGS=("$@")
+
 # --- Parse arguments ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -378,6 +391,40 @@ fi
 if [[ "$INCLUDE_HOST" != true && ${#CTS[@]} -eq 0 ]]; then
   echo "Nothing to do — no host selected and no running containers."
   exit 0
+fi
+
+# =============================================================================
+# CONFIRM-BEFORE-APPLY GATE
+# =============================================================================
+# When applying interactively, first preview what's available (re-run ourselves
+# in check mode with the same targets) and require a y/N before changing
+# anything. Skipped when: -y/--yes was given, this is the nested check pass, or
+# stdin isn't a terminal (the systemd timer, or a piped run) — those apply
+# unattended. Gate on stdin (-t 0) only, NOT stdout: `read` reads stdin and its
+# prompt goes to stderr, so `--apply | tee log` still prompts correctly. This
+# also fails safe — no real stdin means the prompt is skipped for unattended
+# runs, and if it ever fired without stdin, read's EOF leaves _reply empty → "no
+# changes". The check pass has no side effects.
+if [[ "$MODE" == "apply" && "${PVE_UPDATE_NESTED:-}" != "1" && "$ASSUME_YES" != true && -t 0 ]]; then
+  echo ""
+  echo -e "${BOLD}Previewing available updates before applying...${NC}"
+  check_args=()
+  for _a in "${ORIG_ARGS[@]}"; do
+    case "$_a" in
+      --apply|-y|--yes) ;;              # drop apply/consent flags → check mode
+      *) check_args+=("$_a") ;;
+    esac
+  done
+  # </dev/null so the preview's pct exec calls can't consume the terminal input
+  # meant for the prompt below.
+  PVE_UPDATE_NESTED=1 "$(realpath "$0")" --no-update-check "${check_args[@]}" </dev/null
+  echo ""
+  read -r -p "$(echo -e "${BOLD}Apply these updates now? [y/N] ${NC}")" _reply
+  if [[ ! "$_reply" =~ ^[Yy]$ ]]; then
+    echo -e "${YELLOW}No changes made.${NC}"
+    exit 0
+  fi
+  echo ""
 fi
 
 echo ""
@@ -636,6 +683,12 @@ process_ct() {
       pct exec "$ctid" -- rm -f "$_tmp" 2>/dev/null || true
       if [[ $community_exit -eq 0 ]]; then
         echo -e "  ${GREEN}✔  Community script update complete${NC}"
+      elif grep -qiE 'storage too low|dangerously low|too low in unattended|low disk' "$_clog" 2>/dev/null; then
+        # The community script aborted itself as a precondition (not enough free
+        # disk), which is safe/correct — treat it as a skip, not a failure, so it
+        # doesn't clutter the "Failed CTs" line. Free up space and re-run.
+        echo -e "  ${YELLOW}⚠  Community script skipped — low disk space in this container.${NC}"
+        echo -e "  ${YELLOW}   Free space (e.g. 'pct resize ${ctid} rootfs +2G') and re-run.${NC}"
       else
         echo -e "  ${RED}✘  Community script failed (exit $community_exit) — last output:${NC}"
         tail -20 "$_clog" 2>/dev/null | sed 's/^/     /'
@@ -796,7 +849,7 @@ if [[ "$HOST_REBOOT" == true ]]; then
   fi
 fi
 
-if [[ "$MODE" == "check" ]]; then
+if [[ "$MODE" == "check" && "${PVE_UPDATE_NESTED:-}" != "1" ]]; then
   echo ""
   echo -e "  ${YELLOW}This was a CHECK-ONLY run. To apply updates:${NC}"
   echo -e "  ${BOLD}  ./pve-update.sh --apply${NC}            # host + all containers"

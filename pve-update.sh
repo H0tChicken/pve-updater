@@ -670,8 +670,11 @@ process_ct() {
       # non-interactive, so they skip TTY-gated prompts that 'yes |' can't answer.
       # tee streams the output live AND keeps a copy so we can replay the tail on
       # failure. Real pipeline (not $( )), so PIPESTATUS[1] is the timeout/pct exit.
+      # 300s, not 120s: community scripts that rebuild a Node/Next.js app
+      # (homepage runs pnpm install + pnpm build) routinely need 2-5 minutes in a
+      # constrained LXC. A timeout kill surfaces as exit 124 in the failure tail.
       local _clog="/tmp/.pve_clog_$$_${ctid}"
-      yes 2>/dev/null | timeout 120 pct exec "$ctid" -- bash -c "
+      yes 2>/dev/null | timeout 300 pct exec "$ctid" -- bash -c "
         export DEBIAN_FRONTEND=noninteractive
         export TERM=xterm
         export CI=true

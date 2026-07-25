@@ -437,6 +437,7 @@ TOTAL_PKG=0
 TOTAL_COMMUNITY=0
 TOTAL_DOCKER=0
 FAILED_CTS=()
+SKIPPED_CTS=()
 HOST_FAILED=false
 HOST_REBOOT=false
 REBOOT_KERNEL=""
@@ -532,6 +533,7 @@ process_ct() {
   local results_file="$2"
   local CT_START; CT_START=$(date +%s)
   local ct_pkg=0 ct_community=0 ct_docker=0
+  local ct_skipped=""   # reason, when a community script declined a precondition
   local ct_error=false
 
   # Verify the CT is running
@@ -646,7 +648,9 @@ process_ct() {
     echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
     local ct_failed_entry=""
     [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
-    printf '%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" >> "$results_file"
+    local ct_skipped_entry=""
+    [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
+    printf '%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
     return
   fi
 
@@ -690,8 +694,22 @@ process_ct() {
         # The community script aborted itself as a precondition (not enough free
         # disk), which is safe/correct — treat it as a skip, not a failure, so it
         # doesn't clutter the "Failed CTs" line. Free up space and re-run.
+        ct_skipped="low disk space"
         echo -e "  ${YELLOW}⚠  Community script skipped — low disk space in this container.${NC}"
         echo -e "  ${YELLOW}   Free space (e.g. 'pct resize ${ctid} rootfs +2G') and re-run.${NC}"
+      elif grep -qiE 'does not match the recommended|skipping update' "$_clog" 2>/dev/null; then
+        # Same class as low disk: the community script refuses to run because the
+        # container OS is older than the version it targets. Deliberately NOT
+        # bypassed automatically — unlike UPDATE_HOMEBRIDGE_FORCE (a false
+        # positive in our context), this guard is correct: the OS really is old,
+        # and the project says bypassing may break the app with no support. That
+        # is the operator's call, so surface it and let them decide.
+        local _osmsg; _osmsg=$(grep -iE 'does not match the recommended' "$_clog" 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//')
+        ct_skipped="OS version mismatch"
+        echo -e "  ${YELLOW}⚠  Community script skipped — container OS is older than it expects.${NC}"
+        [[ -n "$_osmsg" ]] && echo -e "  ${YELLOW}   ${_osmsg}${NC}"
+        echo -e "  ${YELLOW}   Upgrade the container OS, or opt in to the project's documented${NC}"
+        echo -e "  ${YELLOW}   bypass inside CT ${ctid} (unsupported — may break the app).${NC}"
       else
         echo -e "  ${RED}✘  Community script failed (exit $community_exit) — last output:${NC}"
         tail -20 "$_clog" 2>/dev/null | sed 's/^/     /'
@@ -785,7 +803,9 @@ process_ct() {
   echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
   local ct_failed_entry=""
   [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
-  printf '%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" >> "$results_file"
+  local ct_skipped_entry=""
+  [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
+  printf '%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
 }
 
 # =============================================================================
@@ -813,11 +833,12 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
   unset _pid_outfile
 
   # Aggregate per-CT results into the global counters.
-  while IFS='|' read -r r_pkg r_comm r_docker r_failed; do
+  while IFS='|' read -r r_pkg r_comm r_docker r_failed r_skipped; do
     TOTAL_PKG=$((TOTAL_PKG + r_pkg))
     TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
     TOTAL_DOCKER=$((TOTAL_DOCKER + r_docker))
     [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
+    [[ -n "$r_skipped" ]] && SKIPPED_CTS+=("$r_skipped")
   done < "$_results"
   rm -f "$_results"
 fi
@@ -842,6 +863,15 @@ fi
 
 if [[ ${#FAILED_CTS[@]} -gt 0 ]]; then
   echo -e "  ${RED}Failed CTs:            ${FAILED_CTS[*]}${NC}"
+fi
+
+# Skips are preconditions the community script declined (low disk, OS mismatch)
+# — not failures, but list them so they don't silently look like successes.
+if [[ ${#SKIPPED_CTS[@]} -gt 0 ]]; then
+  echo -e "  ${YELLOW}Skipped (needs action):${NC}"
+  for _s in "${SKIPPED_CTS[@]}"; do
+    echo -e "  ${YELLOW}   - ${_s}${NC}"
+  done
 fi
 
 if [[ "$HOST_REBOOT" == true ]]; then

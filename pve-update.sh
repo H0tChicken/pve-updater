@@ -404,7 +404,10 @@ fi
 # prompt goes to stderr, so `--apply | tee log` still prompts correctly. This
 # also fails safe — no real stdin means the prompt is skipped for unattended
 # runs, and if it ever fired without stdin, read's EOF leaves _reply empty → "no
-# changes". The check pass has no side effects.
+# changes". The check pass still changes nothing, but it is no longer purely
+# local: to tell whether an unpinned Docker image is stale it queries that
+# image's registry (read-only, no layers downloaded), so the preview now takes a
+# few seconds per Docker container.
 if [[ "$MODE" == "apply" && "${PVE_UPDATE_NESTED:-}" != "1" && "$ASSUME_YES" != true && -t 0 ]]; then
   echo ""
   echo -e "${BOLD}Previewing available updates before applying...${NC}"
@@ -435,7 +438,10 @@ echo -e "${BOLD}═════════════════════�
 
 TOTAL_PKG=0
 TOTAL_COMMUNITY=0
-TOTAL_DOCKER=0
+# Two different outcomes, two different counters: images we pulled (or would
+# pull), vs images stuck on a pinned tag that only a compose-file edit can move.
+TOTAL_DOCKER_UPDATED=0
+TOTAL_DOCKER_PINNED=0
 FAILED_CTS=()
 SKIPPED_CTS=()
 HOST_FAILED=false
@@ -532,7 +538,7 @@ process_ct() {
   local ctid="$1"
   local results_file="$2"
   local CT_START; CT_START=$(date +%s)
-  local ct_pkg=0 ct_community=0 ct_docker=0
+  local ct_pkg=0 ct_community=0 ct_docker_updated=0 ct_docker_pinned=0
   local ct_skipped=""   # reason, when a community script declined a precondition
   local ct_error=false
 
@@ -540,7 +546,7 @@ process_ct() {
   local status; status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
   if [[ "$status" != "running" ]]; then
     echo -e "\n${YELLOW}⏭  CT $ctid — not running, skipping${NC}"
-    printf '0|0|0|\n' >> "$results_file"
+    printf '0|0|0|0||\n' >> "$results_file"
     return
   fi
 
@@ -558,14 +564,14 @@ process_ct() {
   # Detect apps that need extra env vars to upgrade non-interactively.
   # homebridge-apt-pkg refuses apt upgrades whose process tree includes
   # hb-service (its own updater runs under it) unless UPDATE_HOMEBRIDGE_FORCE=1
-  # is set. Detecting homebridge reliably under pct exec is fiddly — the
-  # 'homebridge' binary lives under the package's private node runtime and
-  # hb-service isn't consistently on PATH — so we just always set the flag on
-  # Debian/apt containers. It's a homebridge-only variable that every other
-  # package ignores, so it is harmless elsewhere.
+  # is set. Don't probe for the 'homebridge' binary — it lives under the
+  # package's private node runtime and hb-service isn't consistently on PATH.
+  # Ask dpkg instead: the package is named 'homebridge', so a plain 'dpkg -s'
+  # is an exact, cheap answer, and the flag gets set only where it applies.
   local extra_env=""
   if [[ "$pkg_manager" == "apt" ]]; then
-    extra_env="UPDATE_HOMEBRIDGE_FORCE=1"
+    local has_homebridge; has_homebridge=$(pct exec "$ctid" -- sh -c 'dpkg -s homebridge >/dev/null 2>&1 && echo yes || echo no' 2>/dev/null)
+    [[ "$has_homebridge" == "yes" ]] && extra_env="UPDATE_HOMEBRIDGE_FORCE=1"
   fi
 
   echo ""
@@ -650,7 +656,7 @@ process_ct() {
     [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
     local ct_skipped_entry=""
     [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-    printf '%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
+    printf '%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
     return
   fi
 
@@ -700,8 +706,8 @@ process_ct() {
       elif grep -qiE 'does not match the recommended|skipping update' "$_clog" 2>/dev/null; then
         # Same class as low disk: the community script refuses to run because the
         # container OS is older than the version it targets. Deliberately NOT
-        # bypassed automatically — unlike UPDATE_HOMEBRIDGE_FORCE (a false
-        # positive in our context), this guard is correct: the OS really is old,
+        # bypassed automatically — unlike UPDATE_HOMEBRIDGE_FORCE, which clears a
+        # guard that misfires on us, this one is correct: the OS really is old,
         # and the project says bypassing may break the app with no support. That
         # is the operator's call, so surface it and let them decide.
         local _osmsg; _osmsg=$(grep -iE 'does not match the recommended' "$_clog" 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//')
@@ -754,7 +760,7 @@ process_ct() {
         if [[ "$is_pinned" == true ]]; then
           echo -e "  ${YELLOW}📌 ${cname}${NC} — ${cimage} (pinned version)"
           echo -e "     ${YELLOW}→ Update the tag in your compose file to upgrade${NC}"
-          ct_docker=$((ct_docker + 1))
+          ct_docker_pinned=$((ct_docker_pinned + 1))
         else
           echo -e "  🐳 ${cname} — ${cimage}"
 
@@ -767,7 +773,7 @@ process_ct() {
               echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
             else
               echo -e "  ${GREEN}⬆  New image pulled for ${cimage}${NC}"
-              ct_docker=$((ct_docker + 1))
+              ct_docker_updated=$((ct_docker_updated + 1))
 
               # Find the compose file that manages this container and recreate
               while IFS= read -r cf; do
@@ -785,7 +791,35 @@ process_ct() {
               done <<< "$compose_files"
             fi
           else
-            echo -e "     ${YELLOW}→ Run with --apply to pull & recreate${NC}"
+            # Check mode must not pull, so ask the registry instead of the
+            # daemon. A pulled image's .Id IS the image config digest, and
+            # 'docker manifest inspect --verbose' reports the config digest of
+            # every manifest behind the tag — so if our local .Id appears in
+            # that output, the tag still resolves to what we already run and a
+            # pull would be a no-op. Comparing RepoDigests instead would NOT
+            # work: those hold the manifest-list digest, while --verbose reports
+            # per-platform manifest digests, so every multi-arch image would
+            # look stale. Grepping the whole output also keeps this arch-correct
+            # — only our own platform's entry can carry our config digest.
+            # DOCKER_CLI_EXPERIMENTAL is for older CLIs that still gate
+            # 'docker manifest'; newer ones ignore it.
+            local local_id remote_manifest
+            local_id=$(pct exec "$ctid" -- docker image inspect --format '{{.Id}}' "$cimage" 2>/dev/null)
+            # Image refs come from container metadata, so pass the ref as a
+            # positional arg rather than interpolating it into the sh -c string.
+            remote_manifest=$(pct exec "$ctid" -- sh -c 'DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect --verbose "$1" 2>/dev/null' _ "$cimage" 2>/dev/null)
+
+            if [[ -z "$local_id" || -z "$remote_manifest" ]]; then
+              # Locally-built image, private registry needing auth, rate limit or
+              # no network. Never guess here: an empty local_id would make the
+              # grep below match everything and report "up to date" for all.
+              echo -e "     ${YELLOW}→ Could not query the registry — run with --apply to pull${NC}"
+            elif grep -qF "$local_id" <<< "$remote_manifest"; then
+              echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
+            else
+              echo -e "     ${YELLOW}→ Update available — run with --apply to pull & recreate${NC}"
+              ct_docker_updated=$((ct_docker_updated + 1))
+            fi
           fi
         fi
       done <<< "$docker_info"
@@ -805,7 +839,7 @@ process_ct() {
   [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
   local ct_skipped_entry=""
   [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-  printf '%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
+  printf '%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
 }
 
 # =============================================================================
@@ -833,10 +867,11 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
   unset _pid_outfile
 
   # Aggregate per-CT results into the global counters.
-  while IFS='|' read -r r_pkg r_comm r_docker r_failed r_skipped; do
+  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_failed r_skipped; do
     TOTAL_PKG=$((TOTAL_PKG + r_pkg))
     TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
-    TOTAL_DOCKER=$((TOTAL_DOCKER + r_docker))
+    TOTAL_DOCKER_UPDATED=$((TOTAL_DOCKER_UPDATED + r_dock_upd))
+    TOTAL_DOCKER_PINNED=$((TOTAL_DOCKER_PINNED + r_dock_pin))
     [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
     [[ -n "$r_skipped" ]] && SKIPPED_CTS+=("$r_skipped")
   done < "$_results"
@@ -851,18 +886,24 @@ echo ""
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}  Summary  (${TOTAL_ELAPSED}s elapsed)${NC}"
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
-echo -e "  PVE host updated:      $([[ "$INCLUDE_HOST" == true ]] && echo yes || echo no)"
-echo -e "  Containers scanned:    ${#CTS[@]}"
-echo -e "  Package upgrades:      ${TOTAL_PKG}"
-echo -e "  Community-script CTs:  ${TOTAL_COMMUNITY}"
-echo -e "  Docker images noted:   ${TOTAL_DOCKER}"
+echo -e "  PVE host updated:            $([[ "$INCLUDE_HOST" == true ]] && echo yes || echo no)"
+echo -e "  Containers scanned:          ${#CTS[@]}"
+echo -e "  Package upgrades:            ${TOTAL_PKG}"
+echo -e "  Community-script CTs:        ${TOTAL_COMMUNITY}"
+# Check mode counts what a pull WOULD change, so don't claim it already happened.
+if [[ "$MODE" == "apply" ]]; then
+  echo -e "  Images updated:              ${TOTAL_DOCKER_UPDATED}"
+else
+  echo -e "  Images with updates:         ${TOTAL_DOCKER_UPDATED}"
+fi
+echo -e "  Images pinned (manual bump): ${TOTAL_DOCKER_PINNED}"
 
 if [[ "$HOST_FAILED" == true ]]; then
-  echo -e "  ${RED}PVE host:              dist-upgrade failed${NC}"
+  echo -e "  ${RED}PVE host:                    dist-upgrade failed${NC}"
 fi
 
 if [[ ${#FAILED_CTS[@]} -gt 0 ]]; then
-  echo -e "  ${RED}Failed CTs:            ${FAILED_CTS[*]}${NC}"
+  echo -e "  ${RED}Failed CTs:                  ${FAILED_CTS[*]}${NC}"
 fi
 
 # Skips are preconditions the community script declined (low disk, OS mismatch)
@@ -876,9 +917,9 @@ fi
 
 if [[ "$HOST_REBOOT" == true ]]; then
   if [[ -n "$REBOOT_KERNEL" ]]; then
-    echo -e "  ${YELLOW}Reboot required:       boot into ${REBOOT_KERNEL} (run 'reboot')${NC}"
+    echo -e "  ${YELLOW}Reboot required:             boot into ${REBOOT_KERNEL} (run 'reboot')${NC}"
   else
-    echo -e "  ${YELLOW}Reboot required:       run 'reboot' on the PVE host${NC}"
+    echo -e "  ${YELLOW}Reboot required:             run 'reboot' on the PVE host${NC}"
   fi
 fi
 

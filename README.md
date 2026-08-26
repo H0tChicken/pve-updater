@@ -128,8 +128,9 @@ rm /etc/systemd/system/pve-update.{service,timer}
 
 ## Notes
 
-- **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first
+- **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first. The summary counts them separately (`Images pinned (manual bump)`) from images the script actually updated, because only the pinned ones need you to edit a file
+- **Check mode and Docker**: a `--check` run asks each unpinned image's registry whether the tag still resolves to the image you're running, so its count matches what `--apply` would do. It's read-only — no layers are downloaded and no container is recreated. If a registry can't be reached (private repo needing auth, rate limit, locally-built image) the image is reported as unknown rather than guessed at, and left out of the count
 - **Reboots** are never triggered automatically — the script flags when one is needed and which kernel to boot into
-- **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set on all Debian/apt containers so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block unattended upgrades (the variable is ignored by every other package)
+- **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set only on containers where `dpkg -s homebridge` confirms the package is installed, so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block unattended upgrades. Other containers are left alone
 - **Low disk space**: if a community script aborts itself because the container is low on disk, that's reported as a **skip** (not a failure) — free space (e.g. `pct resize <id> rootfs +2G`) and re-run
 - **Community scripts** are written to a temp file before execution to prevent shell injection from script content

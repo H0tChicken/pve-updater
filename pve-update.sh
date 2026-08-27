@@ -442,6 +442,7 @@ TOTAL_COMMUNITY=0
 # pull), vs images stuck on a pinned tag that only a compose-file edit can move.
 TOTAL_DOCKER_UPDATED=0
 TOTAL_DOCKER_PINNED=0
+TOTAL_DOCKER_UNKNOWN=0
 FAILED_CTS=()
 SKIPPED_CTS=()
 HOST_FAILED=false
@@ -538,7 +539,7 @@ process_ct() {
   local ctid="$1"
   local results_file="$2"
   local CT_START; CT_START=$(date +%s)
-  local ct_pkg=0 ct_community=0 ct_docker_updated=0 ct_docker_pinned=0
+  local ct_pkg=0 ct_community=0 ct_docker_updated=0 ct_docker_pinned=0 ct_docker_unknown=0
   local ct_skipped=""   # reason, when a community script declined a precondition
   local ct_error=false
 
@@ -546,7 +547,7 @@ process_ct() {
   local status; status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
   if [[ "$status" != "running" ]]; then
     echo -e "\n${YELLOW}⏭  CT $ctid — not running, skipping${NC}"
-    printf '0|0|0|0||\n' >> "$results_file"
+    printf '0|0|0|0|0||\n' >> "$results_file"
     return
   fi
 
@@ -656,7 +657,7 @@ process_ct() {
     [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
     local ct_skipped_entry=""
     [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-    printf '%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
+    printf '%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
     return
   fi
 
@@ -792,33 +793,52 @@ process_ct() {
             fi
           else
             # Check mode must not pull, so ask the registry instead of the
-            # daemon. A pulled image's .Id IS the image config digest, and
-            # 'docker manifest inspect --verbose' reports the config digest of
-            # every manifest behind the tag — so if our local .Id appears in
-            # that output, the tag still resolves to what we already run and a
-            # pull would be a no-op. Comparing RepoDigests instead would NOT
-            # work: those hold the manifest-list digest, while --verbose reports
-            # per-platform manifest digests, so every multi-arch image would
-            # look stale. Grepping the whole output also keeps this arch-correct
-            # — only our own platform's entry can carry our config digest.
-            # DOCKER_CLI_EXPERIMENTAL is for older CLIs that still gate
-            # 'docker manifest'; newer ones ignore it.
-            local local_id remote_manifest
-            local_id=$(pct exec "$ctid" -- docker image inspect --format '{{.Id}}' "$cimage" 2>/dev/null)
+            # daemon and compare digests. RepoDigests is the right local side:
+            # it holds the digest of the manifest/index that was pulled for this
+            # tag, and it means the same thing under both the classic and the
+            # containerd image store. '.Id' does NOT — under containerd it is
+            # the index digest, under the classic store the config digest — so
+            # comparing '.Id' against a remote config digest silently reports
+            # every image as stale on a containerd host (verified: Docker 29.x
+            # with the containerd snapshotter). 'buildx imagetools inspect'
+            # returns the index digest the tag resolves to right now, which is
+            # exactly what RepoDigests can be compared against. Registry read
+            # only: no layers are fetched and no container is touched.
+            local local_digest remote_out remote_digest
             # Image refs come from container metadata, so pass the ref as a
             # positional arg rather than interpolating it into the sh -c string.
-            remote_manifest=$(pct exec "$ctid" -- sh -c 'DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect --verbose "$1" 2>/dev/null' _ "$cimage" 2>/dev/null)
+            local_digest=$(pct exec "$ctid" -- sh -c \
+              'docker image inspect --format "{{index .RepoDigests 0}}" "$1" 2>/dev/null' _ "$cimage" 2>/dev/null)
+            local_digest="${local_digest##*@}"
+            # 2>&1: the error text is what tells a rate limit apart from a
+            # genuine failure, and both are worth reporting differently.
+            remote_out=$(pct exec "$ctid" -- sh -c \
+              'docker buildx imagetools inspect --format "{{.Manifest.Digest}}" "$1" 2>&1' _ "$cimage" 2>/dev/null)
+            # Anchored, so a digest quoted inside an error message can never be
+            # mistaken for a successful answer.
+            remote_digest=$(printf '%s\n' "$remote_out" | grep -oE '^sha256:[0-9a-f]{64}$' | head -n1)
 
-            if [[ -z "$local_id" || -z "$remote_manifest" ]]; then
-              # Locally-built image, private registry needing auth, rate limit or
-              # no network. Never guess here: an empty local_id would make the
-              # grep below match everything and report "up to date" for all.
-              echo -e "     ${YELLOW}→ Could not query the registry — run with --apply to pull${NC}"
-            elif grep -qF "$local_id" <<< "$remote_manifest"; then
-              echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
+            if [[ -n "$local_digest" && -n "$remote_digest" ]]; then
+              if [[ "$local_digest" == "$remote_digest" ]]; then
+                echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
+              else
+                echo -e "     ${YELLOW}→ Update available — run with --apply to pull & recreate${NC}"
+                ct_docker_updated=$((ct_docker_updated + 1))
+              fi
             else
-              echo -e "     ${YELLOW}→ Update available — run with --apply to pull & recreate${NC}"
-              ct_docker_updated=$((ct_docker_updated + 1))
+              # Never guess: count it as unchecked so the summary can say the
+              # count is incomplete instead of implying everything is current.
+              ct_docker_unknown=$((ct_docker_unknown + 1))
+              if [[ "$remote_out" == *"429"* || "$remote_out" == *"oo many requests"* ]]; then
+                # Docker Hub's anonymous cap, which a multi-CT sweep really does
+                # trip. Transient, and 'docker login' inside the CT raises it.
+                echo -e "     ${YELLOW}→ Not checked — Docker Hub rate limit (429); retry later${NC}"
+              elif [[ -z "$local_digest" ]]; then
+                # No RepoDigest at all: built locally, never pulled from a registry.
+                echo -e "     ${YELLOW}→ Not checked — no registry digest (locally built image)${NC}"
+              else
+                echo -e "     ${YELLOW}→ Not checked — could not query the registry${NC}"
+              fi
             fi
           fi
         fi
@@ -839,7 +859,7 @@ process_ct() {
   [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
   local ct_skipped_entry=""
   [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-  printf '%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
 }
 
 # =============================================================================
@@ -867,11 +887,12 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
   unset _pid_outfile
 
   # Aggregate per-CT results into the global counters.
-  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_failed r_skipped; do
+  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_failed r_skipped; do
     TOTAL_PKG=$((TOTAL_PKG + r_pkg))
     TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
     TOTAL_DOCKER_UPDATED=$((TOTAL_DOCKER_UPDATED + r_dock_upd))
     TOTAL_DOCKER_PINNED=$((TOTAL_DOCKER_PINNED + r_dock_pin))
+    TOTAL_DOCKER_UNKNOWN=$((TOTAL_DOCKER_UNKNOWN + r_dock_unk))
     [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
     [[ -n "$r_skipped" ]] && SKIPPED_CTS+=("$r_skipped")
   done < "$_results"
@@ -897,6 +918,11 @@ else
   echo -e "  Images with updates:         ${TOTAL_DOCKER_UPDATED}"
 fi
 echo -e "  Images pinned (manual bump): ${TOTAL_DOCKER_PINNED}"
+# An image the registry wouldn't answer for is neither "up to date" nor "has
+# an update" — say so rather than let a 0 in the line above read as all-clear.
+if [[ "$TOTAL_DOCKER_UNKNOWN" -gt 0 ]]; then
+  echo -e "  ${YELLOW}Images not checked:          ${TOTAL_DOCKER_UNKNOWN} (see per-container detail above)${NC}"
+fi
 
 if [[ "$HOST_FAILED" == true ]]; then
   echo -e "  ${RED}PVE host:                    dist-upgrade failed${NC}"

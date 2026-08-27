@@ -407,7 +407,10 @@ fi
 # changes". The check pass still changes nothing, but it is no longer purely
 # local: to tell whether an unpinned Docker image is stale it queries that
 # image's registry (read-only, no layers downloaded), so the preview now takes a
-# few seconds per Docker container.
+# few seconds per Docker container. One consequence worth knowing: those queries
+# can trip Docker Hub's anonymous rate limit, so the preview may report an image
+# as "Not checked" and then the apply right after it pulls that image fine. The
+# preview is a best-effort forecast, not a promise about what apply will find.
 if [[ "$MODE" == "apply" && "${PVE_UPDATE_NESTED:-}" != "1" && "$ASSUME_YES" != true && -t 0 ]]; then
   echo ""
   echo -e "${BOLD}Previewing available updates before applying...${NC}"

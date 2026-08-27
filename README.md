@@ -75,10 +75,18 @@ gpg --export "$FPR" | base64 | tr -d '\n'
 signing — the embedded key is part of what gets signed):
 
 ```bash
-./sign-release.sh    # -> pve-update.sh.sig   (export SIGN_KEY=$FPR to pick a key)
+./sign-release.sh    # -> pve-update.sh.sig
 git add pve-update.sh pve-update.sh.sig
 git commit -m "Release" && git push
 ```
+
+`sign-release.sh` reads the key you pinned in step 2 and signs with *that* key,
+so it picks the right one even when your keyring holds several secret keys — you
+do not need to set `SIGN_KEY`. It then verifies its own output against the pinned
+key and fails, leaving any previous `.sig` untouched, if they don't match. That
+check matters because a signature from the wrong key looks fine locally and only
+surfaces later as a rejected `--self-update` on someone else's machine. Set
+`SIGN_KEY=<fingerprint>` only to override the derived key while rotating keys.
 
 > First-time note: existing installs still carry the placeholder key, so
 > `--self-update` on them will refuse until you `curl` down one fresh copy that

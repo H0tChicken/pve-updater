@@ -693,6 +693,13 @@ process_ct() {
         export TERM=xterm
         export CI=true
         export NPM_CONFIG_YES=true
+        # The community-scripts engine runs under 'set -u' and reads HOME when
+        # it installs per-tool runtimes (uv, deno, pnpm). A non-login 'pct exec'
+        # shell never sets HOME, and the systemd timer has none to pass in, so
+        # unattended runs abort with 'HOME: unbound variable' -- sometimes after
+        # the script has already stopped the app's service, leaving it down
+        # until the next run. These scripts run as root inside the CT.
+        export HOME=/root
         ${extra_env:+export $extra_env; }
         bash $_tmp
       " 2>&1 | tee "$_clog"

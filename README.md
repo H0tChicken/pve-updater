@@ -114,6 +114,22 @@ before changing anything — answer `n` and nothing is touched. Pass `-y` to ski
 the prompt. The systemd timer runs with no terminal, so it always applies
 unattended (the prompt is skipped automatically).
 
+Containers are processed in parallel, and each container's report prints as soon
+as that container finishes, so one slow container doesn't hold back the rest. In
+a terminal, a live status line shows which containers are still running.
+
+### Running over SSH
+
+Use `ssh -t` so the remote side gets a terminal:
+
+```bash
+ssh -t root@pve ./pve-update.sh --apply
+```
+
+Without `-t`, `ssh` gives the script no terminal. You lose colors and the live
+status line, and **`--apply` skips the confirm prompt and applies straight away**,
+the same as the unattended timer. The script prints a warning when it detects this.
+
 ## Automatic updates (systemd timer)
 
 ```bash

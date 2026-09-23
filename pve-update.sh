@@ -411,6 +411,13 @@ fi
 # can trip Docker Hub's anonymous rate limit, so the preview may report an image
 # as "Not checked" and then the apply right after it pulls that image fine. The
 # preview is a best-effort forecast, not a promise about what apply will find.
+#
+# A plain `ssh root@pve ./pve-update.sh` allocates no TTY, which silently
+# drops colors, the live progress line and — with --apply — this prompt. The
+# systemd timer never sets SSH_CONNECTION, so this hint only reaches SSH users.
+if [[ -n "${SSH_CONNECTION:-}" && ! -t 0 && "${PVE_UPDATE_NESTED:-}" != "1" ]]; then
+  echo "Note: no terminal detected over SSH — run 'ssh -t' for colors, live progress and the apply prompt." >&2
+fi
 if [[ "$MODE" == "apply" && "${PVE_UPDATE_NESTED:-}" != "1" && "$ASSUME_YES" != true && -t 0 ]]; then
   echo ""
   echo -e "${BOLD}Previewing available updates before applying...${NC}"
@@ -486,10 +493,16 @@ update_host() {
 
     if [[ "$MODE" == "apply" ]]; then
       echo -e "  ${CYAN}[$(timestamp)] [apt]${NC} Applying upgrades (dist-upgrade)..."
-      local apt_output apt_exit
-      apt_output=$(DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y 2>&1)
-      apt_exit=$?
-      echo "$apt_output" | grep -E '^(Unpacking|Setting up|Errors|E:|Processing|Need to)' | sed "s/^/     /"
+      # Stream the progress lines as they happen instead of capturing and
+      # printing at the end — a big dist-upgrade can take minutes, and over SSH
+      # that looked like a hang. Line-buffered so it streams even when piped.
+      # Exit status comes from apt-get itself: under pipefail, grep matching
+      # nothing would otherwise read as a failed upgrade.
+      local apt_exit
+      DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y 2>&1 \
+        | grep --line-buffered -E '^(Unpacking|Setting up|Errors|E:|Processing|Need to)' \
+        | sed -u "s/^/     /"
+      apt_exit=${PIPESTATUS[0]}
       if [[ $apt_exit -eq 0 ]]; then
         echo -e "  ${GREEN}✔  apt dist-upgrade applied${NC}"
       else
@@ -888,13 +901,55 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
     _pid_order+=("$_pid")
   done
 
-  # Wait in submission order so CT blocks print in a predictable sequence.
-  for _pid in "${_pid_order[@]}"; do
-    wait "$_pid"
-    cat "${_pid_outfile[$_pid]}"
-    rm -f "${_pid_outfile[$_pid]}"
+  # Print each CT's block as soon as that CT finishes, rather than in submission
+  # order — otherwise one slow CT (a multi-minute community-script rebuild)
+  # hides every other CT's finished output, which over SSH looks like a hang.
+  # Polled with kill -0 rather than 'wait -n -p' (bash 5.1+) for portability,
+  # and so each tick can redraw the live status line on a terminal.
+  _live_status=false
+  [[ -t 1 ]] && _live_status=true
+  _clear_status() { [[ "$_live_status" == true ]] && printf '\r\033[K'; }
+  # Leave a clean line if the run is interrupted mid-redraw. Only installed
+  # here, so it can't clobber self_update's EXIT trap (they never co-occur).
+  trap '_clear_status' EXIT
+  trap '_clear_status; exit 130' INT
+  trap '_clear_status; exit 143' TERM
+
+  declare -A _pid_ctid
+  for _i in "${!_pid_order[@]}"; do _pid_ctid[${_pid_order[$_i]}]="${CTS[$_i]}"; done
+  _pending=("${_pid_order[@]}")
+  _total=${#_pid_order[@]}
+  _wait_start=$(date +%s)
+
+  while [[ ${#_pending[@]} -gt 0 ]]; do
+    _still=()
+    for _pid in "${_pending[@]}"; do
+      if kill -0 "$_pid" 2>/dev/null; then
+        _still+=("$_pid")
+      else
+        wait "$_pid" 2>/dev/null
+        _clear_status
+        cat "${_pid_outfile[$_pid]}"
+        rm -f "${_pid_outfile[$_pid]}"
+      fi
+    done
+    _pending=("${_still[@]}")
+    [[ ${#_pending[@]} -eq 0 ]] && break
+
+    if [[ "$_live_status" == true ]]; then
+      _el=$(( $(date +%s) - _wait_start ))
+      _line="⏳ $(( _total - ${#_pending[@]} ))/${_total} done ($(( _el / 60 ))m$(printf '%02d' $(( _el % 60 )))s) — waiting on CT"
+      for _pid in "${_pending[@]}"; do _line+=" ${_pid_ctid[$_pid]}"; done
+      # Truncate to the terminal width: a wrapped line breaks the \r redraw.
+      _cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}'); [[ "$_cols" =~ ^[0-9]+$ && $_cols -gt 10 ]] || _cols=80
+      [[ ${#_line} -ge $_cols ]] && _line="${_line:0:$(( _cols - 3 ))}…"
+      printf '\r\033[K%s' "$_line"
+    fi
+    sleep 1
   done
-  unset _pid_outfile
+  _clear_status
+  trap - EXIT INT TERM
+  unset _pid_outfile _pid_ctid
 
   # Aggregate per-CT results into the global counters.
   while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_failed r_skipped; do

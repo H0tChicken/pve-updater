@@ -14,6 +14,7 @@
 #   ./pve-update.sh --host-only         # Only update the Proxmox host
 #   ./pve-update.sh --apply --no-host   # Apply to all CTs but skip the host
 #   ./pve-update.sh --apply -y          # Apply without the confirm prompt
+#   ./pve-update.sh --apply --exclude 129,130  # Leave CTs 129 + 130 alone
 #   ./pve-update.sh --install-timer          # Install weekly systemd timer (apply mode)
 #   ./pve-update.sh --install-timer daily    # Install daily systemd timer
 #   ./pve-update.sh --self-update            # Pull + GPG-verify the latest script
@@ -38,7 +39,9 @@
 #   0. PVE host: apt update && check/apply dist-upgrade (full-upgrade)
 #   1. OS-level: apt/apk update && check/apply upgrades (Debian + Alpine)
 #   2. Community scripts: detect /usr/bin/update and run it (--apply)
-#   3. Docker: detect running containers, pull new images, recreate (--apply)
+#   3. Docker: detect running containers, pull new images, and recreate only
+#      the containers still running an older image (--apply). Locally built
+#      images and failed pulls are reported, never recreated.
 #
 # The Proxmox host is included by default. Use 'host'/'pve' as a target,
 # --host-only, or --no-host to control this. The host uses dist-upgrade
@@ -46,6 +49,12 @@
 # a new kernel/libs require it — the script never reboots automatically.
 # New LXCs are automatically discovered — no configuration needed.
 # VMs (qm) are not handled by this script.
+#
+# To keep the run away from a CT: --exclude 129,130 (or, for the timer, set
+# PVE_UPDATE_EXCLUDE=129,130 in a systemd drop-in). To defer a CT only while
+# it's busy, put an executable at /etc/pve-updater/hooks/<ctid> on the host:
+# it runs before each --apply touches that CT, gets the CT ID as $1, and a
+# non-zero exit skips the CT until the next run.
 #
 # For Docker containers with PINNED version tags (e.g. traefik:v3.6.17),
 # the script will warn you but NOT auto-update — you must manually change
@@ -262,6 +271,23 @@ TIMER_SCHEDULE="weekly"
 SELF_UPDATE=false
 NO_UPDATE_CHECK=false
 ASSUME_YES=false
+EXCLUDE_CTS=()
+
+# CT IDs separated by commas and/or spaces, e.g. "129,130" or "129 130".
+add_excludes() {
+  local id
+  for id in ${1//,/ }; do
+    if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+      echo "Invalid CT ID '$id' for --exclude / PVE_UPDATE_EXCLUDE (use e.g. --exclude 129,130)" >&2
+      exit 1
+    fi
+    EXCLUDE_CTS+=("$id")
+  done
+}
+
+# The timer has no command line to add --exclude to, so it can also come from
+# the environment (a systemd drop-in: Environment=PVE_UPDATE_EXCLUDE=129,130).
+[[ -n "${PVE_UPDATE_EXCLUDE:-}" ]] && add_excludes "$PVE_UPDATE_EXCLUDE"
 
 # Capture the original invocation so the confirm gate can replay it in check mode.
 ORIG_ARGS=("$@")
@@ -277,6 +303,13 @@ while [[ $# -gt 0 ]]; do
     --self-update) SELF_UPDATE=true; shift ;;
     --no-update-check) NO_UPDATE_CHECK=true; shift ;;
     -y|--yes) ASSUME_YES=true; shift ;;
+    --exclude)
+      # Take the value here, or a bare ID would fall through to *) as a target.
+      if [[ $# -lt 2 || "$2" == -* ]]; then
+        echo "--exclude needs a CT list, e.g. --exclude 129,130" >&2; exit 1
+      fi
+      add_excludes "$2"; shift 2 ;;
+    --exclude=*) add_excludes "${1#--exclude=}"; shift ;;
     --version)
       echo "pve-update.sh  (sha256 $(self_sha | cut -c1-12))"
       exit 0 ;;
@@ -388,6 +421,15 @@ fi
 # --no-host always wins.
 [[ "$NO_HOST" == true ]] && INCLUDE_HOST=false
 
+# --exclude wins too, even over a CT named explicitly as a target.
+if [[ ${#EXCLUDE_CTS[@]} -gt 0 ]]; then
+  _kept=()
+  for _c in "${CTS[@]}"; do
+    [[ " ${EXCLUDE_CTS[*]} " == *" $_c "* ]] || _kept+=("$_c")
+  done
+  CTS=("${_kept[@]}")
+fi
+
 if [[ "$INCLUDE_HOST" != true && ${#CTS[@]} -eq 0 ]]; then
   echo "Nothing to do — no host selected and no running containers."
   exit 0
@@ -444,6 +486,7 @@ echo ""
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}  Proxmox Update Report — $(date '+%Y-%m-%d %H:%M:%S')${NC}"
 echo -e "${BOLD}  Mode: ${CYAN}${MODE}${NC}${BOLD}  APT-only: ${APT_ONLY}  Host: ${INCLUDE_HOST}  Containers: ${#CTS[@]}${NC}"
+[[ ${#EXCLUDE_CTS[@]} -gt 0 ]] && echo -e "${BOLD}  Excluded: ${EXCLUDE_CTS[*]}${NC}"
 echo -e "${BOLD}═══════════════════════════════════════════════════════════════${NC}"
 
 TOTAL_PKG=0
@@ -569,6 +612,32 @@ process_ct() {
 
   local ct_hostname; ct_hostname=$(pct config "$ctid" 2>/dev/null | awk '/^hostname/{print $2}')
 
+  # Optional per-CT busy guard. Some workloads can't be restarted at any moment
+  # (a live session, a long job), and an unattended run has no one to ask. If
+  # the host has an executable /etc/pve-updater/hooks/<ctid>, it runs first
+  # with the CT ID as $1, and a non-zero exit (or no answer within 60s) defers
+  # the whole CT to the next run, untouched. Apply mode only — a check changes
+  # nothing. No hook file means no change in behavior.
+  local hook="/etc/pve-updater/hooks/${ctid}" hook_note=""
+  if [[ "$MODE" == "apply" && -x "$hook" ]]; then
+    local hook_out hook_exit
+    hook_out=$(timeout 60 "$hook" "$ctid" </dev/null 2>&1)
+    hook_exit=$?
+    if [[ $hook_exit -ne 0 ]]; then
+      local why="exit $hook_exit"
+      [[ $hook_exit -eq 124 ]] && why="timed out after 60s"
+      echo ""
+      echo -e "${BOLD}───────────────────────────────────────────────────────────────${NC}"
+      echo -e "${BOLD}  CT ${ctid} — ${ct_hostname}${NC}"
+      echo -e "${BOLD}───────────────────────────────────────────────────────────────${NC}"
+      echo -e "  ${YELLOW}⏸  Deferred by ${hook} (${why}) — nothing changed in this CT${NC}"
+      [[ -n "$hook_out" ]] && printf '%s\n' "$hook_out" | tail -n 5 | sed 's/^/     /'
+      printf '0|0|0|0|0||%s\n' "$ctid ($ct_hostname): deferred by hook ($why)" >> "$results_file"
+      return
+    fi
+    hook_note="$hook_out"
+  fi
+
   # Detect OS and package manager — handles Alpine (ash/apk) vs Debian (bash/apt)
   local os; os=$(pct exec "$ctid" -- sh -c '. /etc/os-release 2>/dev/null; echo "$PRETTY_NAME"' 2>/dev/null)
   local pkg_manager="apt"
@@ -595,6 +664,7 @@ process_ct() {
   echo -e "${BOLD}───────────────────────────────────────────────────────────────${NC}"
   echo -e "${BOLD}  CT ${ctid} — ${ct_hostname}${NC}  (${os:-unknown OS}) [${pkg_manager}]"
   echo -e "${BOLD}───────────────────────────────────────────────────────────────${NC}"
+  [[ -n "$hook_note" ]] && printf '%s\n' "$hook_note" | tail -n 5 | sed 's/^/  [hook] /'
 
   # =========================================================================
   # 1. OS PACKAGE UPGRADES
@@ -759,7 +829,15 @@ process_ct() {
   if [[ "$has_docker" == "yes" ]]; then
     echo -e "\n  ${CYAN}[$(timestamp)] [docker]${NC} Checking Docker containers..."
 
-    local docker_info; docker_info=$(pct exec "$ctid" -- docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    # The image ref each container was created from (.Config.Image), not
+    # 'docker ps' {{.Image}}: once a container's tag has moved on to a newer
+    # image (a manual pull, or a run whose recreate failed), ps shows a bare
+    # image ID instead, which can't be pulled or compared, so the container
+    # would stay on the old image for good.
+    local docker_info; docker_info=$(pct exec "$ctid" -- sh -c '
+      ids=$(docker ps -q) && [ -n "$ids" ] &&
+        docker inspect --format "{{.Name}}|{{.Config.Image}}" $ids | sed "s#^/##"
+    ' </dev/null 2>/dev/null)
 
     if [[ -n "$docker_info" ]]; then
       local compose_files; compose_files=$(pct exec "$ctid" -- sh -c '
@@ -789,30 +867,107 @@ process_ct() {
           echo -e "  🐳 ${cname} — ${cimage}"
 
           if [[ "$MODE" == "apply" ]]; then
+            # Recreating restarts whatever the container is doing, so only do it
+            # when the container really runs an older image than its tag now
+            # points at. That is decided from image IDs, never from the text
+            # 'docker pull' prints: a pull that FAILS prints no "Image is up to
+            # date", and reading that silence as "new image" force-recreated
+            # locally built containers on every run (issue #3). Refs are passed
+            # as positional args, as in check mode below, and </dev/null keeps
+            # pct exec from eating the rest of the container list on stdin.
+
+            # Built locally (never pulled), so there's no registry to pull from.
+            # Same verdict and wording as check mode. Only the classic store
+            # leaves RepoDigests empty: the containerd store gives a local build
+            # a digest of its own (verified: Docker 29.8), so there the pull
+            # below fails instead and that is what keeps it from being touched.
+            local repo_digests
+            repo_digests=$(pct exec "$ctid" -- sh -c \
+              'docker image inspect --format "{{len .RepoDigests}}" "$1" 2>/dev/null' _ "$cimage" </dev/null 2>/dev/null)
+            if [[ "$repo_digests" == "0" ]]; then
+              ct_docker_unknown=$((ct_docker_unknown + 1))
+              echo -e "     ${YELLOW}→ Not checked — no registry digest (locally built image)${NC}"
+              continue
+            fi
+
             echo -e "  ${CYAN}[$(timestamp)] [docker]${NC} Pulling ${cimage}..."
-            local pull_output; pull_output=$(pct exec "$ctid" -- docker pull "$cimage" 2>&1)
-            echo "$pull_output" | grep -E '^(Pulling|Digest|Status)' | sed 's/^/     /'
+            local pull_output pull_exit
+            pull_output=$(pct exec "$ctid" -- sh -c 'docker pull "$1" 2>&1' _ "$cimage" </dev/null 2>&1)
+            pull_exit=$?
+            if [[ $pull_exit -ne 0 ]]; then
+              # Nothing new arrived, so there is nothing to recreate. Not
+              # checked, like a registry check-mode couldn't reach.
+              ct_docker_unknown=$((ct_docker_unknown + 1))
+              if [[ "$pull_output" == *"429"* || "$pull_output" == *"oo many requests"* ]]; then
+                echo -e "     ${YELLOW}→ Not pulled — Docker Hub rate limit (429); retry later${NC}"
+              else
+                local pull_err
+                pull_err=$(printf '%s\n' "$pull_output" | grep -iE 'error|denied|not found|unauthorized' | head -n1)
+                [[ -z "$pull_err" ]] && pull_err=$(printf '%s\n' "$pull_output" | grep -v '^[[:space:]]*$' | tail -n1)
+                local pull_hint=""
+                [[ "$pull_output" == *"repository does not exist"* ]] && pull_hint=" (locally built image?)"
+                echo -e "     ${YELLOW}→ Not pulled${pull_hint} — pull failed (exit ${pull_exit}): ${pull_err}${NC}"
+              fi
+              continue
+            fi
+            echo "$pull_output" | grep -E '^(Digest|Status)' | sed 's/^/     /'
 
-            if echo "$pull_output" | grep -q "Image is up to date"; then
+            # '.Image' on a container and '.Id' on an image are the same kind of
+            # ID from the same local store, so they compare cleanly under both
+            # the classic and the containerd store (unlike '.Id' vs a REMOTE
+            # digest — see check mode). It also catches a second container on
+            # the same tag, whose own pull finds nothing new because the first
+            # container's pull already fetched it.
+            local running_id tag_id
+            running_id=$(pct exec "$ctid" -- sh -c \
+              'docker inspect --format "{{.Image}}" "$1" 2>/dev/null' _ "$cname" </dev/null 2>/dev/null)
+            tag_id=$(pct exec "$ctid" -- sh -c \
+              'docker image inspect --format "{{.Id}}" "$1" 2>/dev/null' _ "$cimage" </dev/null 2>/dev/null)
+            if [[ -z "$running_id" || -z "$tag_id" ]]; then
+              ct_docker_unknown=$((ct_docker_unknown + 1))
+              echo -e "     ${YELLOW}→ Not checked — could not read the container's or the tag's image ID${NC}"
+              continue
+            fi
+            if [[ "$running_id" == "$tag_id" ]]; then
               echo -e "  ${GREEN}✔  ${cimage} is already up to date${NC}"
-            else
-              echo -e "  ${GREEN}⬆  New image pulled for ${cimage}${NC}"
-              ct_docker_updated=$((ct_docker_updated + 1))
+              continue
+            fi
 
-              # Find the compose file that manages this container and recreate
+            echo -e "  ${GREEN}⬆  New image for ${cimage}${NC}"
+            ct_docker_updated=$((ct_docker_updated + 1))
+
+            # Recreate just this container's service. A bare 'up -d' would also
+            # start stopped services and recreate any drifted one in the same
+            # file, and --force-recreate restarted every service in it.
+            local svc recreated=false
+            svc=$(pct exec "$ctid" -- sh -c \
+              'docker inspect --format "{{index .Config.Labels \"com.docker.compose.service\"}}" "$1" 2>/dev/null' \
+              _ "$cname" </dev/null 2>/dev/null)
+            if [[ -n "$svc" ]]; then
               while IFS= read -r cf; do
                 [[ -z "$cf" ]] && continue
-                local managed; managed=$(pct exec "$ctid" -- sh -c "
-                  docker compose -f '$cf' ps --format '{{.Names}}' 2>/dev/null | grep -qxF '$cname' && echo yes || echo no
-                " 2>/dev/null)
+                local managed; managed=$(pct exec "$ctid" -- sh -c \
+                  'docker compose -f "$1" ps --format "{{.Names}}" 2>/dev/null | grep -qxF "$2" && echo yes || echo no' \
+                  _ "$cf" "$cname" </dev/null 2>/dev/null)
 
                 if [[ "$managed" == "yes" ]]; then
-                  echo -e "  ${CYAN}[$(timestamp)] [docker]${NC} Recreating via ${cf}..."
-                  pct exec "$ctid" -- sh -c "docker compose -f '$cf' up -d --force-recreate 2>&1" | sed 's/^/     /'
-                  echo -e "  ${GREEN}✔  Container recreated${NC}"
+                  recreated=true
+                  echo -e "  ${CYAN}[$(timestamp)] [docker]${NC} Recreating ${svc} via ${cf}..."
+                  pct exec "$ctid" -- sh -c 'docker compose -f "$1" up -d --no-deps "$2" 2>&1' \
+                    _ "$cf" "$svc" </dev/null | sed 's/^/     /'
+                  local up_exit=${PIPESTATUS[0]}
+                  if [[ $up_exit -eq 0 ]]; then
+                    echo -e "  ${GREEN}✔  Container recreated${NC}"
+                  else
+                    echo -e "  ${RED}✘  Recreate failed (exit ${up_exit}) — ${cname} is still on the old image${NC}"
+                    ct_error=true
+                  fi
                   break
                 fi
               done <<< "$compose_files"
+            fi
+            if [[ "$recreated" != true ]]; then
+              echo -e "     ${YELLOW}→ No compose file found for ${cname} — new image pulled, recreate the container yourself${NC}"
             fi
           else
             # Check mode must not pull, so ask the registry instead of the

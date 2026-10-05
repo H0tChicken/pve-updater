@@ -7,7 +7,7 @@ A single-file Proxmox VE update script that checks and applies updates across th
 - **PVE host** — `apt dist-upgrade` (full-upgrade, per Proxmox best practice) with kernel-aware reboot detection
 - **LXC containers** — apt (Debian/Ubuntu) and apk (Alpine) package upgrades, run in parallel
 - **Community scripts** — detects and runs [tteck](https://community-scripts.github.io/ProxmoxVE/) `/usr/bin/update` hooks
-- **Docker** — pulls new images and recreates containers via compose; warns on pinned version tags
+- **Docker** — pulls new images and recreates, via compose, only the containers still running an older image; warns on pinned version tags
 
 New containers are discovered automatically. VMs (`qm`) are not handled.
 
@@ -105,6 +105,7 @@ surfaces later as a rejected `--self-update` on someone else's machine. Set
 ./pve-update.sh --apt-only --apply    # OS packages only (skip community scripts + Docker)
 ./pve-update.sh --apply --no-host     # All CTs, skip PVE host
 ./pve-update.sh --apply -y            # Apply without the confirm prompt
+./pve-update.sh --apply --exclude 129,130  # Leave CTs 129 and 130 alone
 ./pve-update.sh --self-update         # Update this script from GitHub
 ```
 
@@ -117,6 +118,36 @@ unattended (the prompt is skipped automatically).
 Containers are processed in parallel, and each container's report prints as soon
 as that container finishes, so one slow container doesn't hold back the rest. In
 a terminal, a live status line shows which containers are still running.
+
+### Keeping a busy container out of a run
+
+Some containers mustn't be restarted at an arbitrary moment, for example one that's
+recording a live session. There are two ways to protect them:
+
+**Exclude it outright.** `--exclude 129,130` (or `--exclude=129`) skips those CTs
+entirely, even when they're also named as targets. The timer has no command line to
+add it to, so set it with a systemd drop-in instead. This survives `--install-timer`,
+which rewrites the unit file:
+
+```bash
+systemctl edit pve-update.service
+# [Service]
+# Environment=PVE_UPDATE_EXCLUDE=129,130
+```
+
+**Defer it only while it's busy.** Put an executable at `/etc/pve-updater/hooks/<ctid>`
+on the PVE host. Before `--apply` touches that CT, the script runs the hook with the CT
+ID as `$1`. Exit 0 means go ahead. Any other exit, or no answer within 60 s, skips the
+whole CT for this run (no apt, community script or Docker), and the summary lists it
+under *Skipped*. The next run asks again. Check runs never call the hook. For example:
+
+```bash
+#!/bin/sh
+# /etc/pve-updater/hooks/129: only update CT 129 when it reports idle
+exec pct exec "$1" -- /usr/local/sbin/reboot-when-idle --check
+```
+
+With no hook file, nothing changes.
 
 ### Running over SSH
 
@@ -152,6 +183,7 @@ rm /etc/systemd/system/pve-update.{service,timer}
 
 ## Notes
 
+- **When Docker containers get recreated**: on `--apply`, a container is recreated only when its image ID differs from the ID its tag points at after the pull. Only that container's compose service is recreated (`docker compose up -d --no-deps <service>`); other services in the same file are left alone. A locally built image is skipped: on the classic image store it has no registry digest and isn't pulled at all, and on the containerd store its pull fails. A failed pull, such as an auth error, a missing repo or Docker Hub's 429, is reported under `Images not checked`. No failed or skipped pull restarts anything. A container not managed by a compose file is reported, not recreated
 - **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first. The summary counts them separately (`Images pinned (manual bump)`) from images the script actually updated, because only the pinned ones need you to edit a file
 - **Check mode and Docker**: a `--check` run asks each unpinned image's registry whether the tag still resolves to the image you're running, so its count matches what `--apply` would do. It's read-only — no layers are downloaded and no container is recreated. If a registry can't be reached (private repo needing auth, locally-built image, or Docker Hub's anonymous rate limit — a sweep of many containers can trip its 429) the image is reported as not checked rather than guessed at, and a `Images not checked` line appears in the summary so a `0` above it is never mistaken for all-clear. Running `docker login` inside the container raises the Hub limit
 - **Reboots** are never triggered automatically — the script flags when one is needed and which kernel to boot into

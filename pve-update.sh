@@ -499,6 +499,7 @@ TOTAL_COMMUNITY=0
 TOTAL_DOCKER_UPDATED=0
 TOTAL_DOCKER_PINNED=0
 TOTAL_DOCKER_UNKNOWN=0
+TOTAL_APP_FOUND=0
 TOTAL_APP_BEHIND=0
 TOTAL_APP_UNKNOWN=0
 FAILED_CTS=()
@@ -604,31 +605,47 @@ fi
 # (/var/lib/<app>/config.xml, as both the community scripts and the Servarr
 # install guide do it), asks the app's own API what it is running and which
 # versions its updater offers. One line per app:
-#   app|running|branch|update mechanism|UpdateAutomatically|/root/.<app>|offered,...
+#   app|running|branch|update mechanism|UpdateAutomatically|/root/.<app>|offered,...|started,...|note
 # The API key is read and used only in here: curl gets it on stdin (-K -), so
 # it never shows up in argv, and it is never printed. An empty 'running' means
-# /system/status didn't answer. An empty 'offered' means /update didn't; that
-# one asks servarr.com, so it fails on its own (DNS hiccups) more often.
+# /system/status didn't answer (note says why when it's known: no curl in the
+# CT). An empty 'offered' means /update didn't; that one asks servarr.com, so
+# it fails on its own (DNS hiccups) more often.
+# 'started' is every version the app's own log shows it starting as, read only
+# when a community script installed it (the marker exists): the major-version
+# guard needs the newest one that ever touched the database, and the log still
+# has it when the app is down or its API won't answer.
 # Sonarr, Radarr and Whisparr serve /api/v3; Prowlarr, Lidarr and Readarr /api/v1.
 ARR_PROBE='
-command -v curl >/dev/null 2>&1 || exit 0
+x() { sed -n "s:.*<$1>\([^<]*\)</$1>.*:\1:p" "$cfg" | head -n1; }
+api() { printf "header = \"X-Api-Key: %s\"\n" "$key" | curl -fsS --max-time "$2" -K - "$url/$1" 2>/dev/null; }
+f() { printf "%s" "$st" | grep -oE "\"$1\": *\"[^\"]*\"" | head -n1 | sed "s/.*: *\"//; s/\"\$//"; }
 for spec in sonarr:v3 radarr:v3 whisparr:v3 prowlarr:v1 lidarr:v1 readarr:v1; do
   app=${spec%%:*}; cfg=/var/lib/$app/config.xml
   [ -f "$cfg" ] || continue
-  x() { sed -n "s:.*<$1>\([^<]*\)</$1>.*:\1:p" "$cfg" | head -n1; }
+  marker=$(head -n1 "/root/.$app" 2>/dev/null | tr -d " \r|") started=""
+  [ -n "$marker" ] && started=$(grep -hoE "Starting [A-Za-z]+ - .* - Version [0-9.]+" \
+    "/var/lib/$app/logs/$app.txt" /var/lib/$app/logs/$app.[0-9]*.txt 2>/dev/null |
+    sed "s/.* Version //" | sort -u | tr "\n" ",")
+  if ! command -v curl >/dev/null 2>&1; then
+    printf "%s|||||%s||%s|no curl\n" "$app" "$marker" "${started%,}"; continue
+  fi
   port=$(x Port); base=$(x UrlBase); bind=$(x BindAddress); key=$(x ApiKey)
   case "$bind" in ""|"*"|0.0.0.0|::|"[::]") bind=127.0.0.1 ;; *:*) bind="[$bind]" ;; esac
   url="http://$bind:${port:-0}$base/api/${spec#*:}"
-  api() { printf "header = \"X-Api-Key: %s\"\n" "$key" | curl -fsS --max-time "$2" -K - "$url/$1" 2>/dev/null; }
   st=$(api system/status 10)
-  f() { printf "%s" "$st" | grep -oE "\"$1\": *\"[^\"]*\"" | head -n1 | sed "s/.*: *\"//; s/\"\$//"; }
   running=$(f version) offered=""
   [ -n "$running" ] && offered=$(api update 20 | grep -oE "\"version\": *\"[0-9.]+\"" | grep -oE "[0-9][0-9.]*" | tr "\n" ",")
-  marker=$(head -n1 "/root/.$app" 2>/dev/null | tr -d " \r|")
-  printf "%s|%s|%s|%s|%s|%s|%s\n" "$app" "$running" "$(f branch)" "$(f packageUpdateMechanism)" \
-    "$(x UpdateAutomatically)" "$marker" "${offered%,}"
+  printf "%s|%s|%s|%s|%s|%s|%s|%s|\n" "$app" "$running" "$(f branch)" "$(f packageUpdateMechanism)" \
+    "$(x UpdateAutomatically)" "$marker" "${offered%,}" "${started%,}"
 done
 '
+
+# Highest of the comma-separated versions in $1, or nothing if it's empty.
+max_version() {
+  [[ -n "${1//,/}" ]] || return 0
+  printf '%s\n' ${1//,/ } | sort -V | tail -n1
+}
 
 # True when version $1 is a newer MAJOR than version $2 (either may start with
 # 'v'). False whenever either side isn't a plain number, so a missing marker or
@@ -639,6 +656,19 @@ major_ahead() {
   [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && (( 10#$a > 10#$b ))
 }
 
+# Append one CT's line to the results file. Called from inside process_ct and
+# reads its locals (bash scoping is dynamic), so the column order — which the
+# aggregation loop after the parallel run reads back — lives only here.
+emit_result() {
+  local failed="" skipped="" no_path=""
+  [[ "$ct_error" == true ]] && failed="$ctid ($ct_hostname)"
+  [[ -n "$ct_skipped" ]] && skipped="$ctid ($ct_hostname): $ct_skipped"
+  [[ -n "$ct_no_path" ]] && no_path="$ctid ($ct_hostname): ${ct_no_path%, }"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" \
+    "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" \
+    "$ct_app_found" "$ct_app_behind" "$ct_app_unknown" "$failed" "$skipped" "$no_path" >> "$results_file"
+}
+
 # =============================================================================
 # PER-CONTAINER UPDATE LOGIC  (called in parallel — one subprocess per CT)
 # =============================================================================
@@ -647,20 +677,21 @@ process_ct() {
   local results_file="$2"
   local CT_START; CT_START=$(date +%s)
   local ct_pkg=0 ct_community=0 ct_docker_updated=0 ct_docker_pinned=0 ct_docker_unknown=0
-  local ct_app_behind=0 ct_app_unknown=0
+  local ct_app_found=0 ct_app_behind=0 ct_app_unknown=0
   local ct_no_path=""   # *arr apps nothing updates unattended
   local ct_skipped=""   # reason, when a community script declined a precondition
   local ct_error=false
+  local ct_hostname=""
 
   # Verify the CT is running
   local status; status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
   if [[ "$status" != "running" ]]; then
     echo -e "\n${YELLOW}⏭  CT $ctid — not running, skipping${NC}"
-    printf '0|0|0|0|0|0|0|||\n' >> "$results_file"
+    emit_result
     return
   fi
 
-  local ct_hostname; ct_hostname=$(pct config "$ctid" 2>/dev/null | awk '/^hostname/{print $2}')
+  ct_hostname=$(pct config "$ctid" 2>/dev/null | awk '/^hostname/{print $2}')
 
   # Optional per-CT busy guard. Some workloads can't be restarted at any moment
   # (a live session, a long job), and an unattended run has no one to ask. If
@@ -682,7 +713,8 @@ process_ct() {
       echo -e "${BOLD}───────────────────────────────────────────────────────────────${NC}"
       echo -e "  ${YELLOW}⏸  Deferred by ${hook} (${why}) — nothing changed in this CT${NC}"
       [[ -n "$hook_out" ]] && printf '%s\n' "$hook_out" | tail -n 5 | sed 's/^/     /'
-      printf '0|0|0|0|0|0|0||%s|\n' "$ctid ($ct_hostname): deferred by hook ($why)" >> "$results_file"
+      ct_skipped="deferred by hook ($why)"
+      emit_result
       return
     fi
     hook_note="$hook_out"
@@ -789,15 +821,21 @@ process_ct() {
   if [[ "$APT_ONLY" == true ]]; then
     local CT_ELAPSED=$(( $(date +%s) - CT_START ))
     echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
-    local ct_failed_entry=""
-    [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
-    local ct_skipped_entry=""
-    [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-    printf '%s|%s|%s|%s|%s|0|0|%s|%s|\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" "$ct_failed_entry" "$ct_skipped_entry" >> "$results_file"
+    emit_result
     return
   fi
 
-  local has_update; has_update=$(pct exec "$ctid" -- sh -c 'test -f /usr/bin/update && echo yes || echo no' 2>/dev/null)
+  # Read the community-script entrypoint up front: the app report below needs
+  # to know which app it updates, not just that one exists. It names its
+  # script as SCRIPT_SLUG (current format) or as .../ct/<slug>.sh (older).
+  local has_update update_cmd="" cs_slug=""
+  has_update=$(pct exec "$ctid" -- sh -c 'test -f /usr/bin/update && echo yes || echo no' 2>/dev/null)
+  if [[ "$has_update" == "yes" ]]; then
+    update_cmd=$(pct exec "$ctid" -- cat /usr/bin/update 2>/dev/null)
+    cs_slug=$(printf '%s\n' "$update_cmd" | sed -n 's/^export SCRIPT_SLUG="\([A-Za-z0-9._-]*\)".*/\1/p' | head -n1)
+    [[ -z "$cs_slug" ]] && cs_slug=$(printf '%s\n' "$update_cmd" | grep -oE '/ct/[A-Za-z0-9._-]+\.sh' | head -n1 | sed 's#.*/##; s/\.sh$//')
+    cs_slug="${cs_slug,,}"
+  fi
 
   # =========================================================================
   # 2. *ARR APP VERSIONS  (report only — never updates anything itself)
@@ -805,12 +843,31 @@ process_ct() {
   # A self-updating app (or one moved by hand to a release the community
   # script doesn't track) would otherwise never show up here at all: only apt
   # and the community script's "found" line ever mention it (issue #4).
+  # What each app reports is kept by name for the guard in step 3.
+  local -A arr_marker=() arr_guard_ver=() arr_offered=() arr_behind=()
+  local -a arr_apps=() cs_apps=()
   local arr_info; arr_info=$(pct exec "$ctid" -- sh -c "$ARR_PROBE" </dev/null 2>/dev/null)
   if [[ -n "$arr_info" ]]; then
     echo -e "\n  ${CYAN}[$(timestamp)] [app]${NC} Checking *arr app versions..."
-    while IFS='|' read -r a_app a_run a_branch a_mech a_auto a_marker a_offered; do
+    while IFS='|' read -r a_app a_run a_branch a_mech a_auto a_marker a_offered a_started a_note; do
       [[ -z "$a_app" ]] && continue
-      if [[ -z "$a_run" ]]; then
+      ct_app_found=$((ct_app_found + 1))
+      arr_apps+=("$a_app")
+      arr_marker[$a_app]="$a_marker"
+      arr_offered[$a_app]="$a_offered"
+      # The newest version known to have run, live or from the log.
+      arr_guard_ver[$a_app]=$(max_version "$a_run,$a_started")
+      # Which apps the community script updates: the one it names, or, when
+      # its entrypoint can't be read, every app it left a marker for.
+      if [[ "$has_update" == "yes" ]] && { [[ "$cs_slug" == "$a_app" ]] || [[ -z "$cs_slug" && -n "$a_marker" ]]; }; then
+        cs_apps+=("$a_app")
+      fi
+
+      if [[ "$a_note" == "no curl" ]]; then
+        ct_app_unknown=$((ct_app_unknown + 1))
+        echo -e "  ${YELLOW}⚠  ${a_app} — curl isn't installed in this CT; version not checked${NC}"
+        continue
+      elif [[ -z "$a_run" ]]; then
         ct_app_unknown=$((ct_app_unknown + 1))
         echo -e "  ${YELLOW}⚠  ${a_app} — its API didn't answer; version not checked${NC}"
         continue
@@ -820,11 +877,12 @@ process_ct() {
         ct_app_unknown=$((ct_app_unknown + 1))
         echo -e "  ${YELLOW}⚠  ${a_label} — no update list (couldn't reach servarr.com?); not checked${NC}"
       else
-        local a_newest; a_newest=$(printf '%s\n' "$a_run" ${a_offered//,/ } | sort -V | tail -n1)
+        local a_newest; a_newest=$(max_version "$a_run,$a_offered")
         if [[ "$a_newest" == "$a_run" ]]; then
           echo -e "  ${GREEN}✔  ${a_label} is the newest build${NC}"
         else
           ct_app_behind=$((ct_app_behind + 1))
+          arr_behind[$a_app]=1
           echo -e "  ${YELLOW}⬆  ${a_label} → ${GREEN}${a_newest}${NC}"
         fi
       fi
@@ -834,9 +892,9 @@ process_ct() {
       if [[ "${a_mech,,}" == "builtin" || -z "$a_mech" ]]; then
         if [[ "${a_auto,,}" == "true" ]]; then
           echo -e "     → updates itself (built-in updater, automatic)"
-        elif [[ "$has_update" == "yes" ]] && major_ahead "$a_run" "$a_marker"; then
+        elif [[ " ${cs_apps[*]} " == *" $a_app "* ]] && major_ahead "${arr_guard_ver[$a_app]}" "$a_marker"; then
           echo -e "     ${YELLOW}→ Nothing updates it — the community script is held back (below)${NC}"
-        elif [[ "$has_update" == "yes" ]]; then
+        elif [[ " ${cs_apps[*]} " == *" $a_app "* ]]; then
           echo -e "     → updated by the community script (--apply)"
         else
           ct_no_path+="${a_app}, "
@@ -854,40 +912,47 @@ process_ct() {
   # =========================================================================
   if [[ "$has_update" == "yes" ]]; then
     ct_community=$((ct_community + 1))
-    local update_cmd; update_cmd=$(pct exec "$ctid" -- cat /usr/bin/update 2>/dev/null)
     echo -e "\n  ${CYAN}[$(timestamp)] [community-script]${NC} Update mechanism found"
 
     # Major-version guard. A community script deploys the release IT tracks
-    # (Sonarr's is pinned to v4), and /root/.<app> records what it last
-    # installed. If the app itself is now on a newer major (moved by hand or by
-    # its built-in updater), running the script would lay the older major over
-    # a database already migrated forward, and those migrations can't be
-    # undone. Skip it as "needs action", like the low-disk and OS refusals. The
-    # same verdict in check mode, so the preview matches what apply will do.
-    # Only for an app the probe above found: the entrypoint names its script
-    # as SCRIPT_SLUG (current format) or as .../ct/<slug>.sh (older format).
-    local cs_slug guard_reason=""
-    cs_slug=$(printf '%s\n' "$update_cmd" | sed -n 's/^export SCRIPT_SLUG="\([A-Za-z0-9._-]*\)".*/\1/p' | head -n1)
-    [[ -z "$cs_slug" ]] && cs_slug=$(printf '%s\n' "$update_cmd" | grep -oE '/ct/[A-Za-z0-9._-]+\.sh' | head -n1 | sed 's#.*/##; s/\.sh$//')
-    local g_line; g_line=$(printf '%s\n' "$arr_info" | awk -F'|' -v s="${cs_slug,,}" 's != "" && $1 == s { print; exit }')
-    if [[ -n "$g_line" ]]; then
-      local g_run g_marker
-      IFS='|' read -r _ g_run _ _ _ g_marker _ <<< "$g_line"
-      if [[ -z "$g_run" ]]; then
-        # Not a reason to skip: the script may be what brings a dead app back.
-        echo -e "  ${YELLOW}⚠  Version guard not applied — ${cs_slug}'s API didn't answer${NC}"
-      elif major_ahead "$g_run" "$g_marker"; then
-        guard_reason="${cs_slug} ${g_run} is a newer major than the community script's ${g_marker}"
-      fi
+    # (Sonarr's is pinned to v4, and even an unpinned one installs the latest
+    # stable, which is older than a pre-release major), and /root/.<app>
+    # records what it last installed. If a newer major has run since (moved by
+    # hand or by the app's own updater), running the script would lay the
+    # older major over a database already migrated forward, and those
+    # migrations can't be undone. Skip it as "needs action", like the low-disk
+    # and OS refusals, in check mode too so the preview matches the apply.
+    # It fails closed: an app the script installed whose version can't be
+    # read (API down AND no start in its log) is skipped as well, since an
+    # irreversible downgrade costs more than one deferred update.
+    # Apps without a marker were never installed by this script: no guard.
+    local guard_reason="" guard_major=false g_app
+    if [[ -z "$cs_slug" && ${#cs_apps[@]} -gt 0 ]]; then
+      echo -e "  ${YELLOW}⚠  Couldn't tell which app /usr/bin/update is for — guarding ${cs_apps[*]}${NC}"
     fi
+    for g_app in "${cs_apps[@]}"; do
+      local g_ver="${arr_guard_ver[$g_app]}" g_marker="${arr_marker[$g_app]}"
+      [[ -z "$g_marker" ]] && continue
+      if [[ -z "$g_ver" ]]; then
+        guard_reason="couldn't tell which ${g_app} version last ran (API down, no start in its log)"
+      elif major_ahead "$g_ver" "$g_marker"; then
+        guard_major=true
+        guard_reason="${g_app} has run ${g_ver}, a newer major than the community script's ${g_marker}"
+      fi
+      [[ -n "$guard_reason" ]] && break
+    done
 
     if [[ -n "$guard_reason" ]]; then
       ct_skipped="$guard_reason"
       local g_verb="skipped"; [[ "$MODE" != "apply" ]] && g_verb="would be skipped"
-      echo -e "  ${YELLOW}⚠  Community script ${g_verb} — ${cs_slug} runs ${g_run}, but the script last${NC}"
-      echo -e "  ${YELLOW}   installed ${g_marker}. Running it could put the older major over a database${NC}"
-      echo -e "  ${YELLOW}   that has already been migrated forward. Update ${cs_slug} with its own updater,${NC}"
-      echo -e "  ${YELLOW}   and remove /usr/bin/update in CT ${ctid} if the script no longer applies.${NC}"
+      echo -e "  ${YELLOW}⚠  Community script ${g_verb} — ${guard_reason}.${NC}"
+      if [[ "$guard_major" == true ]]; then
+        echo -e "  ${YELLOW}   Running it could put the older major over a database that has already been${NC}"
+        echo -e "  ${YELLOW}   migrated forward. Update ${g_app} with its own updater, and remove${NC}"
+        echo -e "  ${YELLOW}   /usr/bin/update in CT ${ctid} if the script no longer applies.${NC}"
+      else
+        echo -e "  ${YELLOW}   Without it a newer major can't be ruled out. Start ${g_app} and re-run.${NC}"
+      fi
     elif [[ "$MODE" == "apply" ]]; then
       echo -e "  ${CYAN}[$(timestamp)] [community-script]${NC} Running update..."
       # Write the script to a temp file to avoid shell expansion of its content,
@@ -921,6 +986,23 @@ process_ct() {
       pct exec "$ctid" -- rm -f "$_tmp" 2>/dev/null || true
       if [[ $community_exit -eq 0 ]]; then
         echo -e "  ${GREEN}✔  Community script update complete${NC}"
+        # The app versions above were read before this ran. Ask again for the
+        # apps it updates that were behind, so the summary isn't stale.
+        local a_recheck=false
+        for g_app in "${cs_apps[@]}"; do [[ -n "${arr_behind[$g_app]:-}" ]] && a_recheck=true; done
+        if [[ "$a_recheck" == true ]]; then
+          local a_name a_now a_fresh
+          while IFS='|' read -r a_name a_now _ _ _ _ a_fresh _; do
+            [[ -n "${arr_behind[$a_name]:-}" && " ${cs_apps[*]} " == *" $a_name "* && -n "$a_now" ]] || continue
+            [[ -n "$a_fresh" ]] || a_fresh="${arr_offered[$a_name]}"
+            if [[ "$(max_version "$a_now,$a_fresh")" == "$a_now" ]]; then
+              ct_app_behind=$((ct_app_behind - 1))
+              echo -e "  ${GREEN}✔  ${a_name} is now on ${a_now}, the newest build${NC}"
+            else
+              echo -e "  ${YELLOW}⬆  ${a_name} is still on ${a_now} — newest is $(max_version "$a_now,$a_fresh")${NC}"
+            fi
+          done < <(pct exec "$ctid" -- sh -c "$ARR_PROBE" </dev/null 2>/dev/null)
+        fi
       elif grep -qiE 'storage too low|dangerously low|too low in unattended|low disk' "$_clog" 2>/dev/null; then
         # The community script aborted itself as a precondition (not enough free
         # disk), which is safe/correct — treat it as a skip, not a failure, so it
@@ -1164,14 +1246,7 @@ process_ct() {
 
   local CT_ELAPSED=$(( $(date +%s) - CT_START ))
   echo -e "  ${CYAN}── completed in ${CT_ELAPSED}s${NC}"
-  local ct_failed_entry=""
-  [[ "$ct_error" == true ]] && ct_failed_entry="$ctid ($ct_hostname)"
-  local ct_skipped_entry=""
-  [[ -n "$ct_skipped" ]] && ct_skipped_entry="$ctid ($ct_hostname): $ct_skipped"
-  local ct_no_path_entry=""
-  [[ -n "$ct_no_path" ]] && ct_no_path_entry="$ctid ($ct_hostname): ${ct_no_path%, }"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" \
-    "$ct_app_behind" "$ct_app_unknown" "$ct_failed_entry" "$ct_skipped_entry" "$ct_no_path_entry" >> "$results_file"
+  emit_result
 }
 
 # =============================================================================
@@ -1241,12 +1316,13 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
   unset _pid_outfile _pid_ctid
 
   # Aggregate per-CT results into the global counters.
-  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_app_behind r_app_unk r_failed r_skipped r_no_path; do
+  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_app_found r_app_behind r_app_unk r_failed r_skipped r_no_path; do
     TOTAL_PKG=$((TOTAL_PKG + r_pkg))
     TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
     TOTAL_DOCKER_UPDATED=$((TOTAL_DOCKER_UPDATED + r_dock_upd))
     TOTAL_DOCKER_PINNED=$((TOTAL_DOCKER_PINNED + r_dock_pin))
     TOTAL_DOCKER_UNKNOWN=$((TOTAL_DOCKER_UNKNOWN + r_dock_unk))
+    TOTAL_APP_FOUND=$((TOTAL_APP_FOUND + r_app_found))
     TOTAL_APP_BEHIND=$((TOTAL_APP_BEHIND + r_app_behind))
     TOTAL_APP_UNKNOWN=$((TOTAL_APP_UNKNOWN + r_app_unk))
     [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
@@ -1281,10 +1357,13 @@ if [[ "$TOTAL_DOCKER_UNKNOWN" -gt 0 ]]; then
   echo -e "  ${YELLOW}Images not checked:          ${TOTAL_DOCKER_UNKNOWN} (see per-container detail above)${NC}"
 fi
 # *arr apps are reported, never updated here (their own updater or the
-# community script does that), so the same wording fits both modes.
-echo -e "  *arr apps behind newest:     ${TOTAL_APP_BEHIND}"
-if [[ "$TOTAL_APP_UNKNOWN" -gt 0 ]]; then
-  echo -e "  ${YELLOW}*arr apps not checked:       ${TOTAL_APP_UNKNOWN} (see per-container detail above)${NC}"
+# community script does that), so the same wording fits both modes. Only on
+# hosts that run any: elsewhere a permanent "0" would just be noise.
+if [[ "$TOTAL_APP_FOUND" -gt 0 ]]; then
+  echo -e "  *arr apps behind newest:     ${TOTAL_APP_BEHIND}"
+  if [[ "$TOTAL_APP_UNKNOWN" -gt 0 ]]; then
+    echo -e "  ${YELLOW}*arr apps not checked:       ${TOTAL_APP_UNKNOWN} (see per-container detail above)${NC}"
+  fi
 fi
 
 if [[ "$HOST_FAILED" == true ]]; then

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test double for the host's 'journalctl' (kernel log). Prints a cgroup OOM
+# kill in CT $FAKE_CT when $FAKE_STATE/oom exists.
+S="$FAKE_STATE"
+echo "journalctl $*" >> "$S/calls.log"
+[[ -f "$S/oom" ]] || exit 0
+echo "Oct 22 18:29:30 pve kernel: oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=ns,mems_allowed=0,oom_memcg=/lxc/${FAKE_CT},task_memcg=/lxc/${FAKE_CT}/ns/.lxc,task=deno,pid=2678158,uid=100000"
+echo "Oct 22 18:29:30 pve kernel: Memory cgroup out of memory: Killed process 2678158 (deno) total-vm:47399368kB, anon-rss:1916080kB"

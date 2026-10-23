@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Test double for 'curl' on the host (the only host-side curl in an --apply
+# run is the ntfy push). Records argv, the -K config read from stdin, and the
+# --data-binary @file body.
+S="$FAKE_STATE"
+printf '%s\n' "$@" > "$S/curl.args"
+args=("$@")
+for (( i = 0; i < ${#args[@]}; i++ )); do
+  case "${args[$i]}" in
+    -K) [[ "${args[$((i+1))]}" == "-" ]] && cat > "$S/curl.stdin" ;;
+    --data-binary) b="${args[$((i+1))]}"; [[ "$b" == @* ]] && cp "${b#@}" "$S/curl.body" ;;
+  esac
+done
+echo "curl" >> "$S/calls.log"
+exit "${FAKE_CURL_EXIT:-0}"

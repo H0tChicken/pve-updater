@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Test double for 'sleep': waits are real but short, so the recovery's
+# minute-long wait for services doesn't make every scenario take a minute.
+exec /usr/bin/sleep 0.05

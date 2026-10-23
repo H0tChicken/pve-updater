@@ -7,7 +7,7 @@ A single-file Proxmox VE update script that checks and applies updates across th
 - **PVE host** — `apt dist-upgrade` (full-upgrade, per Proxmox best practice) with kernel-aware reboot detection
 - **LXC containers** — apt (Debian/Ubuntu) and apk (Alpine) package upgrades, run in parallel
 - **\*arr apps** — reports Sonarr/Radarr/Prowlarr/Lidarr/Readarr/Whisparr versions against the newest build their own updater offers
-- **Community scripts** — detects and runs [tteck](https://community-scripts.github.io/ProxmoxVE/) `/usr/bin/update` hooks, but not over an app that has moved to a newer major
+- **Community scripts** — detects and runs [tteck](https://community-scripts.github.io/ProxmoxVE/) `/usr/bin/update` hooks, but not over an app that has moved to a newer major. A failed update is rolled back to a pre-update ZFS snapshot, logged, and (optionally) pushed to ntfy
 - **Docker** — pulls new images and recreates, via compose, only the containers still running an older image; warns on pinned version tags
 
 New containers are discovered automatically. VMs (`qm`) are not handled.
@@ -175,6 +175,31 @@ View logs after a scheduled run:
 journalctl -u pve-update.service
 ```
 
+A run that had a failure (host dist-upgrade, apt, a community script, a Docker recreate)
+exits non-zero, so the unit shows up in `systemctl --failed`.
+
+### Notifications (ntfy)
+
+To get a push when a run needs you, create `/etc/default/pve-update` (mode 600):
+
+```bash
+PVE_UPDATE_NTFY=https://ntfy.example.com/homelab-updates
+PVE_UPDATE_NTFY_TOKEN=tk_...        # optional, for a protected topic
+```
+
+The file is read as plain `KEY=value` data (never sourced, only these two keys), by timer
+and manual `--apply` runs alike; a value set in the environment (a systemd drop-in) wins.
+Each run sends at most one message, and only when something needs a person:
+
+| Priority | When |
+|---|---|
+| 5 | A community script failed and something may still be down: the rollback failed, or what the script stopped isn't running again (always checked, rollback or not) |
+| 4 | Something failed but nothing is left down: a community script failed and was rolled back, or the host, apt or a Docker recreate failed |
+| 3 | Only `Skipped (needs action)` items: low disk, OS mismatch, the major-version guard |
+
+A clean run sends nothing, nor does a CT deferred by its hook. Check runs never push. The
+token goes to `curl` on stdin, so it doesn't appear in the process list.
+
 Remove the timer:
 
 ```bash
@@ -191,5 +216,18 @@ rm /etc/systemd/system/pve-update.{service,timer}
 - **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set only on containers where `dpkg -s homebridge` confirms the package is installed, so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block unattended upgrades. Other containers are left alone
 - **Low disk space**: if a community script aborts itself because the container is low on disk, that's reported as a **skip** (not a failure) — free space (e.g. `pct resize <id> rootfs +2G`) and re-run
 - **Community scripts** are written to a temp file before execution to prevent shell injection from script content
+- **Failed community-script updates are rolled back**: a community script stops the app, replaces its files and records the new version in `/root/.<app>` *before* it builds, so a failure part-way (a build killed by the CT's memory limit, a timeout) leaves the app down, and every later run sees "no update available". So before running one, `--apply` takes a ZFS snapshot of the CT's root disk (`<dataset>@pve-update-<run>`). If the script fails, the script first saves the evidence to `/var/log/pve-update/<run>-ct<id>-<app>/` on the host (full script output, the CT's `/tmp/create-lxc-*` logs, its journal since the update began, the services it stopped, and any kernel OOM kill in that CT), then stops the CT, rolls the root disk back, starts it, and waits up to a minute for what the script stopped to run again. The app comes back on its previous version, and the next run tries the update again. The snapshot is removed after a successful update, a skip, or a successful rollback, and kept if the rollback fails. Only the root disk is snapshotted: mount points (data volumes, bind-mounted shares) are never rolled back, and anything the CT wrote to its root disk during the update is lost (the app was already stopped). A root disk that isn't a ZFS subvol can't be rolled back; the failure is still logged and reported. Low-disk and OS-mismatch refusals aren't failures and don't roll back
 - **\*arr app versions**: for each app at `/var/lib/<app>/config.xml`, both modes ask the app's own API (on the CT's loopback, with the key from `config.xml`, which never leaves the CT and is never printed) what it runs and which builds its updater offers, and print `running → newest`. This only reports; nothing is updated through the API. It also says what keeps the app current: its built-in updater (when *Automatic* is on), the community script, or nothing. The *arr apps install no updates on their own on Linux unless *Automatic* is turned on in Settings → General → Updates, so an app with that off and no community script is listed under `No automatic app updates`. The update list comes from servarr.com; if that can't be reached, or the CT has no `curl`, the app is counted under `*arr apps not checked`. After `--apply` runs a community script, its apps are checked again (retrying for up to a minute while the app restarts) so the summary reflects the update. The `*arr` summary lines only appear on hosts that run an *arr app
 - **Major-version guard**: before running a community script for an *arr app, the script compares the version that app last ran with the one the community script last installed (`/root/.<app>`). "Last ran" is the higher of what the API reports and the app's most recent `Starting … Version X` log line, so it still works while the app is down. If that's a newer major (moved by hand, or by the app's own updater onto a release the script doesn't track, such as Sonarr v5 against a script pinned to v4), the community script is **skipped** and listed under `Skipped (needs action)`, in check mode too. Running it would put the older major over a database that was already migrated forward, which can't be undone. Update the app with its own updater, and remove `/usr/bin/update` from the CT if the script no longer applies. The guard fails closed: the script is also skipped when neither the API nor the log gives a version, when the app the script names has no `/root/.<app>`, or when the app check couldn't run in the CT at all. If the `/usr/bin/update` entrypoint doesn't say which app it's for, every app with a marker is guarded
+
+## Tests
+
+`tests/run-tests.sh` runs `--apply` against one fake CT to check the community-script rollback,
+the failure log and the ntfy push. `pct`, `zfs`, `pvesm`, `curl` and `journalctl` are test doubles,
+and `PATH` holds only those plus `/usr/bin:/bin`, so the real `pct`/`zfs`/`pvesm` (in `/usr/sbin`)
+can't be reached and nothing on the host or in a real CT is touched. The script insists on root,
+so run it as root on the PVE host or any Linux box with bash 4+:
+
+```bash
+sudo bash tests/run-tests.sh      # KEEP=1 keeps a failing scenario's state dir
+```

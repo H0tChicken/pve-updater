@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stands in for host commands an --apply run against a CT must never call in
+# these tests (apt-get on the host, systemctl, qm). Records and fails.
+echo "$(basename "$0") $*" >> "$FAKE_STATE/unhandled"
+exit 99

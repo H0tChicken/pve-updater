@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Test double for 'pvesm': only 'pvesm path <volid>' is modelled.
+S="$FAKE_STATE"
+echo "pvesm $*" >> "$S/calls.log"
+[[ "$1" == path ]] || { echo "pvesm $*" >> "$S/unhandled"; exit 99; }
+cat "$S/pvesm_path"

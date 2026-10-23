@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Test double for 'pct'. Models one CT whose state lives in $FAKE_STATE:
+#   status            running | stopped
+#   rootfs            the rootfs volume id 'pct config' reports
+#   running           services running right now, one per line
+#   fs/enabled        services that start with the CT
+#   fs/broken         services whose files are gone, so they won't start
+#   cs_mode           what the community script does: ok | fail | lowdisk
+# fs/ is the CT's root disk: the fake zfs snapshots and rolls back that dir.
+# Any call this fake doesn't recognise is recorded in 'unhandled' and fails,
+# so a test notices when the script does something nobody modelled.
+S="$FAKE_STATE"
+echo "pct $*" >> "$S/calls.log"
+unhandled() { echo "pct $*" >> "$S/unhandled"; exit 99; }
+
+cmd="$1"; shift
+case "$cmd" in
+  list)
+    printf 'VMID       Status     Lock         Name\n'
+    printf '%-10s %-10s %-12s %s\n' "$FAKE_CT" "$(cat "$S/status")" "" profilarr
+    ;;
+  status) echo "status: $(cat "$S/status")" ;;
+  config) printf 'hostname: profilarr\nrootfs: %s,size=8G\n' "$(cat "$S/rootfs")" ;;
+  shutdown|stop)
+    [[ -f "$S/fail_stop" ]] && exit 1
+    echo stopped > "$S/status"; : > "$S/running"
+    ;;
+  start)
+    [[ -f "$S/fail_start" ]] && exit 1
+    echo running > "$S/status"
+    grep -vxF -f "$S/fs/broken" "$S/fs/enabled" > "$S/running" || true
+    ;;
+  exec)
+    shift                      # the CT id
+    [[ "$1" == "--" ]] && shift
+    [[ "$1" == "env" ]] && { shift; while [[ "$1" == *=* ]]; do shift; done; }
+    line="$*"
+    case "$line" in
+      *"/etc/os-release"*)            echo "Debian GNU/Linux 13 (trixie)" ;;
+      *"command -v apk"*)             exit 1 ;;
+      *"command -v apt-get"*)         exit 0 ;;
+      *"dpkg -s homebridge"*)         echo no ;;
+      *"apt-get update"*)             exit 0 ;;
+      *"apt-get -s upgrade"*)         exit 1 ;;
+      "cat /usr/bin/update")
+        printf '#!/usr/bin/env bash\nexport SCRIPT_SLUG="profilarr"\nexport UPDATE_SCRIPT_NAME="profilarr"\n' ;;
+      *"#done"*)                      echo "#done" ;;
+      *"cat > /tmp/.pve_update_"*)    cat > /dev/null ;;
+      *"bash /tmp/.pve_update_"*)
+        # stdin is an endless 'yes': never read it.
+        case "$(cat "$S/cs_mode")" in
+          ok)      echo "  Updated successfully!"; exit 0 ;;
+          lowdisk) echo "  Storage too low in unattended mode"; exit 1 ;;
+          fail)
+            echo "  Stopped Service"
+            echo "[ERROR] in line 78: exit code 137 (Killed (SIGKILL / Out of memory?)): while executing command deno run -A npm:vite build"
+            grep -vxF profilarr.service "$S/running" > "$S/running.tmp"; mv "$S/running.tmp" "$S/running"
+            echo profilarr.service >> "$S/fs/broken"
+            exit 137 ;;
+        esac ;;
+      *"systemctl list-units"*)       cat "$S/running" ;;
+      *"create-lxc-"*)                printf '==> /tmp/create-lxc-5628e15f.log.errinfo <==\nEXIT_CODE=137\n' ;;
+      *"journalctl"*)                 echo "Oct 22 18:24:38 profilarr systemd[1]: Stopped profilarr.service" ;;
+      *"touch /tmp/.pve_update_stamp_"*|*"rm -f"*) exit 0 ;;
+      *"command -v docker"*)          echo no ;;
+      *) unhandled exec "$line" ;;
+    esac
+    ;;
+  *) unhandled "$cmd" "$@" ;;
+esac

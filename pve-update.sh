@@ -41,7 +41,9 @@
 #   2. *arr apps (Sonarr, Radarr, Prowlarr, ...): report the running version
 #      against the newest one the app's own updater offers. Report only.
 #   3. Community scripts: detect /usr/bin/update and run it (--apply), unless
-#      the app already runs a newer major than the script last installed
+#      the app already runs a newer major than the script last installed. A
+#      failed run is rolled back to a ZFS snapshot of the CT's root disk taken
+#      just before it, and its evidence kept in /var/log/pve-update/.
 #   4. Docker: detect running containers, pull new images, and recreate only
 #      the containers still running an older image (--apply). Locally built
 #      images and failed pulls are reported, never recreated.
@@ -58,6 +60,10 @@
 # it's busy, put an executable at /etc/pve-updater/hooks/<ctid> on the host:
 # it runs before each --apply touches that CT, gets the CT ID as $1, and a
 # non-zero exit skips the CT until the next run.
+#
+# Optional /etc/default/pve-update (KEY=value, never sourced) sets an ntfy
+# topic URL and token, PVE_UPDATE_NTFY and PVE_UPDATE_NTFY_TOKEN: an --apply
+# run that needs a person then sends one push. A run with a failure exits 1.
 #
 # For Docker containers with PINNED version tags (e.g. traefik:v3.6.17),
 # the script will warn you but NOT auto-update — you must manually change
@@ -292,6 +298,22 @@ add_excludes() {
 # the environment (a systemd drop-in: Environment=PVE_UPDATE_EXCLUDE=129,130).
 [[ -n "${PVE_UPDATE_EXCLUDE:-}" ]] && add_excludes "$PVE_UPDATE_EXCLUDE"
 
+# Optional settings that don't belong on a command line or in the repo: where
+# to push an ntfy notification when a run needs a person, and its token. Read
+# as KEY=value data, never sourced, and only these keys; a value already in the
+# environment (a systemd drop-in) wins. No file means no push.
+PVE_UPDATE_CONFIG="${PVE_UPDATE_CONFIG:-/etc/default/pve-update}"
+PVE_UPDATE_LOG_DIR="${PVE_UPDATE_LOG_DIR:-/var/log/pve-update}"
+if [[ -r "$PVE_UPDATE_CONFIG" ]]; then
+  while IFS= read -r _line || [[ -n "$_line" ]]; do
+    [[ "$_line" =~ ^[[:space:]]*(PVE_UPDATE_NTFY|PVE_UPDATE_NTFY_TOKEN)=(.*)$ ]] || continue
+    _k="${BASH_REMATCH[1]}" _v="${BASH_REMATCH[2]%$'\r'}"
+    [[ "$_v" =~ ^\"(.*)\"$ || "$_v" =~ ^\'(.*)\'$ ]] && _v="${BASH_REMATCH[1]}"
+    [[ -z "${!_k:-}" ]] && printf -v "$_k" '%s' "$_v"
+  done < "$PVE_UPDATE_CONFIG"
+  unset _line _k _v
+fi
+
 # Capture the original invocation so the confirm gate can replay it in check mode.
 ORIG_ARGS=("$@")
 
@@ -503,9 +525,12 @@ TOTAL_APP_FOUND=0
 TOTAL_APP_BEHIND=0
 TOTAL_APP_UNKNOWN=0
 FAILED_CTS=()
+FAIL_PRIO=0          # highest ntfy priority any failure asked for
 SKIPPED_CTS=()
 NO_PATH_APPS=()
 HOST_FAILED=false
+# Names this run's snapshots and failure-log dirs.
+RUN_ID=$(date -d "@$SCRIPT_START" '+%Y%m%d-%H%M%S')
 HOST_REBOOT=false
 REBOOT_KERNEL=""
 
@@ -522,6 +547,133 @@ major_ahead() {
   local a="${1#v}" b="${2#v}"
   a="${a%%.*}"; b="${b%%.*}"
   [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] && (( 10#$a > 10#$b ))
+}
+
+# The ZFS dataset that holds CT $1's root disk, or nothing (return 1) when it
+# isn't a ZFS subvol. Root disk only: mount points (data volumes, bind mounts)
+# are never snapshotted or rolled back.
+ct_rootfs_dataset() {
+  local vol path ds
+  vol=$(pct config "$1" 2>/dev/null | sed -n 's/^rootfs: *\([^,]*\).*/\1/p')
+  [[ -n "$vol" ]] || return 1
+  path=$(pvesm path "$vol" 2>/dev/null) || return 1
+  ds=$(zfs list -H -o name "$path" 2>/dev/null) || return 1
+  # A path on some other dataset (a 'dir' storage that sits on ZFS) resolves to
+  # that dataset: only the CT's own subvol will do.
+  [[ "$ds" == */"${vol#*:}" ]] || return 1
+  echo "$ds"
+}
+
+# Services running in CT $1, one per line (nothing on a CT without systemd).
+ct_running_services() {
+  pct exec "$1" -- sh -c 'systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk "{print \$1}"' \
+    </dev/null 2>/dev/null
+}
+
+# Lines of $1 that aren't in $2 (both newline-separated lists).
+list_minus() {
+  comm -23 <(printf '%s\n' "$1" | sed '/^$/d' | sort -u) <(printf '%s\n' "$2" | sed '/^$/d' | sort -u)
+}
+
+# After a community script failed in a CT: keep the evidence, roll the rootfs
+# back to the pre-update snapshot, start the CT, and check that what the script
+# stopped is running again. Called from process_ct, whose locals it reads
+# (ctid, ct_hostname, cs_slug, cs_snap, cs_before, cs_t0, _clog,
+# community_exit) and sets (ct_fail_note, ct_fail_prio).
+#
+# The evidence goes first because the rollback wipes it from inside the CT.
+# A rollback restarts the whole CT and loses what it wrote since the snapshot:
+# a few minutes, during which the script had stopped the app anyway.
+cs_recover() {
+  local dir="${PVE_UPDATE_LOG_DIR}/${RUN_ID}-ct${ctid}-${cs_slug:-unknown}"
+  mkdir -p "$dir" && chmod 700 "$dir"
+  local after down mins oom=false
+  after=$(ct_running_services "$ctid")
+  down=$(list_minus "$cs_before" "$after")
+  mins=$(( ( $(date +%s) - cs_t0 ) / 60 + 2 ))
+
+  sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' "$_clog" > "$dir/community-script.log" 2>/dev/null
+  # Community scripts log to /tmp/create-lxc-*.log, with a .errinfo on failure.
+  pct exec "$ctid" -- sh -c "for f in \$(find /tmp -maxdepth 1 -name 'create-lxc-*' -mmin -$mins 2>/dev/null); do echo \"==> \$f <==\"; tail -n 300 \"\$f\"; done" \
+    </dev/null > "$dir/ct-tmp-logs.txt" 2>&1
+  pct exec "$ctid" -- sh -c "command -v journalctl >/dev/null && journalctl --no-pager -q -S @$cs_t0 | tail -n 1000" \
+    </dev/null > "$dir/ct-journal.txt" 2>&1
+  # A cgroup OOM kill names the CT on the line before the kill itself.
+  journalctl -k --no-pager -q -S "@$cs_t0" 2>/dev/null | grep -A1 -E "oom_memcg=/lxc/${ctid}([,/]|$)" > "$dir/kernel.txt"
+  [[ -s "$dir/kernel.txt" ]] && oom=true
+  {
+    echo "running before the update:";  printf '%s\n' "$cs_before" | sed '/^$/d; s/^/  /'
+    echo "running after it failed:";     printf '%s\n' "$after" | sed '/^$/d; s/^/  /'
+    echo "stopped by the update:";       printf '%s\n' "$down" | sed '/^$/d; s/^/  /'
+  } > "$dir/services.txt"
+
+  local rolled=false restarted=false
+  if [[ -n "$cs_snap" ]]; then
+    echo -e "  ${CYAN}[$(timestamp)] [rollback]${NC} Stopping CT ${ctid} and rolling back to ${cs_snap}..."
+    pct shutdown "$ctid" --timeout 60 --forceStop 1 >/dev/null 2>&1 || pct stop "$ctid" >/dev/null 2>&1
+    if [[ "$(pct status "$ctid" 2>/dev/null | awk '{print $2}')" == "stopped" ]]; then
+      zfs rollback "$cs_snap" 2>>"$dir/rollback.err" && rolled=true
+      # Back up either way: an old rootfs is better than a CT left stopped.
+      pct start "$ctid" >>"$dir/rollback.err" 2>&1 && restarted=true
+      [[ "$rolled" == true ]] && zfs destroy "$cs_snap" 2>>"$dir/rollback.err"
+    fi
+  fi
+
+  # Wait up to a minute for what the script stopped to come back. Without a
+  # rollback nothing was restarted, so there's nothing to wait for.
+  local ct_up=false still="$down" i
+  for (( i = 0; i < 12; i++ )); do
+    (( i > 0 )) && sleep 5
+    if [[ "$(pct status "$ctid" 2>/dev/null | awk '{print $2}')" != "running" ]]; then
+      [[ "$restarted" == true ]] && continue   # still booting
+      break
+    fi
+    ct_up=true
+    still=$(list_minus "$down" "$(ct_running_services "$ctid")")
+    [[ -z "$still" || "$restarted" != true ]] && break
+  done
+  local still_csv; still_csv=$(printf '%s\n' "$still" | sed '/^$/d' | paste -sd, - | sed 's/,/, /g')
+  local down_csv;  down_csv=$(printf '%s\n' "$down" | sed '/^$/d' | paste -sd, - | sed 's/,/, /g')
+
+  local what="community script failed (exit ${community_exit}"
+  [[ "$oom" == true ]] && what+=", out of memory at the CT's limit"
+  [[ "$community_exit" -eq 124 ]] && what+=", timed out"
+  what+=")"
+  local outcome
+  if [[ "$rolled" == true && "$ct_up" == true && -z "$still" ]]; then
+    ct_fail_prio=4
+    outcome="rolled back to the pre-update snapshot, ${down_csv:-the CT} running again"
+  elif [[ "$rolled" == true ]]; then
+    ct_fail_prio=5
+    outcome="rolled back, but $([[ "$ct_up" == true ]] && echo "still not running: ${still_csv}" || echo "the CT didn't start")"
+  elif [[ -n "$cs_snap" ]]; then
+    ct_fail_prio=5
+    outcome="rollback failed, snapshot kept: ${cs_snap}; $([[ "$ct_up" == true ]] && echo "CT running${still_csv:+, not running: ${still_csv}}" || echo "CT not running")"
+  else
+    ct_fail_prio=4
+    outcome="not rolled back (no snapshot)"
+    if [[ "$ct_up" != true ]]; then ct_fail_prio=5; outcome+=", CT not running"
+    elif [[ -n "$still" ]]; then ct_fail_prio=5; outcome+=", still not running: ${still_csv}"
+    fi
+  fi
+  ct_fail_note="${what}; ${outcome}; log: ${dir}"
+  printf '%s (%s): %s\n' "$ctid" "$ct_hostname" "$ct_fail_note" > "$dir/summary.txt"
+  local colour="$YELLOW"; [[ "$ct_fail_prio" -ge 5 ]] && colour="$RED"
+  echo -e "  ${colour}↺  ${outcome}${NC}"
+  echo -e "  ${colour}   Evidence: ${dir}${NC}"
+}
+
+# Push one ntfy message: <priority> <title> <tags> <body>. The token goes to
+# curl on stdin (-K -) so it never shows up in argv; the body goes in a file
+# so a leading '@' in it can't be read as a file name.
+ntfy_push() {
+  local f rc; f=$(mktemp) || return 1
+  printf '%s' "$4" > "$f"
+  { if [[ -n "${PVE_UPDATE_NTFY_TOKEN:-}" ]]; then printf 'header = "Authorization: Bearer %s"\n' "$PVE_UPDATE_NTFY_TOKEN"; fi; } |
+    curl -fsS --max-time 15 -K - -H "Title: $2" -H "Priority: $1" -H "Tags: $3" --data-binary "@$f" "$PVE_UPDATE_NTFY" >/dev/null 2>&1
+  rc=$?
+  rm -f "$f"
+  return $rc
 }
 
 # =============================================================================
@@ -668,13 +820,16 @@ echo "#done"
 # reads its locals (bash scoping is dynamic), so the column order — which the
 # aggregation loop after the parallel run reads back — lives only here.
 emit_result() {
-  local failed="" skipped="" no_path=""
-  [[ "$ct_error" == true ]] && failed="$ctid ($ct_hostname)"
+  local failed="" skipped="" no_path="" prio=0
+  if [[ "$ct_error" == true ]]; then
+    failed="$ctid ($ct_hostname)${ct_fail_note:+: $ct_fail_note}"
+    prio=${ct_fail_prio:-0}; (( prio > 0 )) || prio=4
+  fi
   [[ -n "$ct_skipped" ]] && skipped="$ctid ($ct_hostname): $ct_skipped"
   [[ -n "$ct_no_path" ]] && no_path="$ctid ($ct_hostname): ${ct_no_path%, }"
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$ct_pkg" "$ct_community" \
     "$ct_docker_updated" "$ct_docker_pinned" "$ct_docker_unknown" \
-    "$ct_app_found" "$ct_app_behind" "$ct_app_unknown" "$failed" "$skipped" "$no_path" >> "$results_file"
+    "$ct_app_found" "$ct_app_behind" "$ct_app_unknown" "$failed" "$skipped" "$no_path" "$prio" >> "$results_file"
 }
 
 # =============================================================================
@@ -689,6 +844,7 @@ process_ct() {
   local ct_no_path=""   # *arr apps nothing updates unattended
   local ct_skipped=""   # reason, when a community script declined a precondition
   local ct_error=false
+  local ct_fail_note="" ct_fail_prio=0   # set when a failed community script was recovered (or not)
   local ct_hostname=""
 
   # Verify the CT is running
@@ -976,6 +1132,26 @@ process_ct() {
         echo -e "  ${YELLOW}   Without it a newer major can't be ruled out. Start ${g_app} and re-run.${NC}"
       fi
     elif [[ "$MODE" == "apply" ]]; then
+      # Roll-back point. A community script stops the app, replaces its files
+      # and bumps /root/.<app> before it builds, so a failure part-way leaves
+      # the app down, and every later run then sees "no update available". An
+      # instant ZFS snapshot of the rootfs lets a failure go back to exactly
+      # what was running (cs_recover). Root disk only, see ct_rootfs_dataset.
+      local cs_ds="" cs_snap="" cs_failed=false cs_t0 cs_before cs_old
+      cs_t0=$(date +%s)
+      cs_before=$(ct_running_services "$ctid")
+      if cs_ds=$(ct_rootfs_dataset "$ctid"); then
+        cs_old=$(zfs list -H -t snapshot -o name -d 1 "$cs_ds" 2>/dev/null | grep '@pve-update-' | paste -sd' ' -)
+        [[ -n "$cs_old" ]] && echo -e "  ${YELLOW}⚠  Snapshot(s) left by an earlier run: ${cs_old}${NC}"
+        if zfs snapshot "${cs_ds}@pve-update-${RUN_ID}" 2>/dev/null; then
+          cs_snap="${cs_ds}@pve-update-${RUN_ID}"
+          echo -e "  ${CYAN}[$(timestamp)] [community-script]${NC} Snapshot ${cs_snap} (rolled back if the update fails)"
+        else
+          echo -e "  ${YELLOW}⚠  Couldn't snapshot ${cs_ds}, so a failed update can't be rolled back${NC}"
+        fi
+      else
+        echo -e "  ${YELLOW}⚠  Root disk is not on ZFS, so a failed update can't be rolled back${NC}"
+      fi
       echo -e "  ${CYAN}[$(timestamp)] [community-script]${NC} Running update..."
       # Write the script to a temp file to avoid shell expansion of its content,
       # then pipe 'yes' to auto-answer interactive prompts (read -p, etc.).
@@ -1063,7 +1239,12 @@ process_ct() {
         echo -e "  ${RED}✘  Community script failed (exit $community_exit) — last output:${NC}"
         tail -20 "$_clog" 2>/dev/null | sed 's/^/     /'
         ct_error=true
+        cs_failed=true
+        cs_recover
       fi
+      # Success, or a script that declined before changing anything: the
+      # snapshot has done its job. cs_recover keeps it if a rollback failed.
+      [[ -n "$cs_snap" && "$cs_failed" != true ]] && zfs destroy "$cs_snap" 2>/dev/null
       rm -f "$_clog" 2>/dev/null || true
     else
       echo -e "  ${YELLOW}→  Run with --apply to execute community-script update${NC}"
@@ -1352,7 +1533,7 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
   unset _pid_outfile _pid_ctid
 
   # Aggregate per-CT results into the global counters.
-  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_app_found r_app_behind r_app_unk r_failed r_skipped r_no_path; do
+  while IFS='|' read -r r_pkg r_comm r_dock_upd r_dock_pin r_dock_unk r_app_found r_app_behind r_app_unk r_failed r_skipped r_no_path r_prio; do
     TOTAL_PKG=$((TOTAL_PKG + r_pkg))
     TOTAL_COMMUNITY=$((TOTAL_COMMUNITY + r_comm))
     TOTAL_DOCKER_UPDATED=$((TOTAL_DOCKER_UPDATED + r_dock_upd))
@@ -1362,6 +1543,7 @@ if [[ ${#CTS[@]} -gt 0 ]]; then
     TOTAL_APP_BEHIND=$((TOTAL_APP_BEHIND + r_app_behind))
     TOTAL_APP_UNKNOWN=$((TOTAL_APP_UNKNOWN + r_app_unk))
     [[ -n "$r_failed" ]] && FAILED_CTS+=("$r_failed")
+    (( ${r_prio:-0} > FAIL_PRIO )) && FAIL_PRIO=$r_prio
     [[ -n "$r_skipped" ]] && SKIPPED_CTS+=("$r_skipped")
     [[ -n "$r_no_path" ]] && NO_PATH_APPS+=("$r_no_path")
   done < "$_results"
@@ -1407,7 +1589,10 @@ if [[ "$HOST_FAILED" == true ]]; then
 fi
 
 if [[ ${#FAILED_CTS[@]} -gt 0 ]]; then
-  echo -e "  ${RED}Failed CTs:                  ${FAILED_CTS[*]}${NC}"
+  echo -e "  ${RED}Failed CTs:${NC}"
+  for _s in "${FAILED_CTS[@]}"; do
+    echo -e "  ${RED}   - ${_s}${NC}"
+  done
 fi
 
 # Skips are preconditions the community script declined (low disk, OS mismatch)
@@ -1446,4 +1631,37 @@ if [[ "$MODE" == "check" && "${PVE_UPDATE_NESTED:-}" != "1" ]]; then
   echo -e "  ${BOLD}  ./pve-update.sh --apt-only --apply${NC} # OS patches only"
 fi
 
+# One ntfy push per apply run, and only when something needs a person: P5 when
+# a CT may still be down, P4 for a failure that was recovered (or nothing went
+# down), P3 when only a "needs action" skip is left. Hook deferrals are the
+# hook working as intended, so they don't count. A clean run sends nothing.
+if [[ "$MODE" == "apply" && "${PVE_UPDATE_NESTED:-}" != "1" && -n "${PVE_UPDATE_NTFY:-}" ]]; then
+  _prio=$FAIL_PRIO _body="" _nfail=${#FAILED_CTS[@]} _nskip=0
+  if [[ "$HOST_FAILED" == true ]]; then
+    _body+="PVE host: dist-upgrade failed"$'\n'; _nfail=$((_nfail + 1)); (( _prio < 4 )) && _prio=4
+  fi
+  for _s in "${FAILED_CTS[@]}"; do _body+="FAILED ${_s}"$'\n'; done
+  for _s in "${SKIPPED_CTS[@]}"; do
+    [[ "$_s" == *"deferred by hook"* ]] && continue
+    _body+="Needs action: ${_s}"$'\n'; _nskip=$((_nskip + 1)); (( _prio < 3 )) && _prio=3
+  done
+  if (( _prio > 0 )); then
+    _title="pve-update on $(hostname -s 2>/dev/null || echo pve):"
+    (( _nfail > 0 )) && _title+=" ${_nfail} failed"
+    (( _nfail > 0 && _nskip > 0 )) && _title+=","
+    (( _nskip > 0 )) && _title+=" ${_nskip} need action"
+    _tags="warning"; (( _prio >= 5 )) && _tags="rotating_light"
+    if ntfy_push "$_prio" "$_title" "$_tags" "${_body%$'\n'}"; then
+      echo -e "  Notification:                sent to ntfy (P${_prio})"
+    else
+      echo -e "  ${YELLOW}Notification:                ntfy push FAILED (P${_prio}) — check PVE_UPDATE_NTFY in ${PVE_UPDATE_CONFIG}${NC}"
+    fi
+  fi
+fi
+
 echo ""
+# Non-zero when anything failed, so a timer run shows up in 'systemctl --failed'.
+if [[ "$HOST_FAILED" == true || ${#FAILED_CTS[@]} -gt 0 ]]; then
+  exit 1
+fi
+exit 0

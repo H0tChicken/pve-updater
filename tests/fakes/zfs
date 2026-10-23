@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Test double for 'zfs'. The CT's root disk is $FAKE_STATE/fs; 'snapshots'
+# lists the snapshots that exist. zfs_path/zfs_ds say which path resolves to
+# which dataset: no zfs_ds file = the rootfs isn't on ZFS.
+S="$FAKE_STATE"
+echo "zfs $*" >> "$S/calls.log"
+case "$1" in
+  list)
+    if [[ " $* " == *" -t snapshot "* ]]; then cat "$S/snapshots"; exit 0; fi
+    [[ -f "$S/zfs_ds" && "${*: -1}" == "$(cat "$S/zfs_path")" ]] || { echo "cannot open '${*: -1}'" >&2; exit 1; }
+    cat "$S/zfs_ds"
+    ;;
+  snapshot)
+    echo "$2" >> "$S/snapshots"
+    rm -rf "$S/snap"; cp -r "$S/fs" "$S/snap"
+    ;;
+  rollback)
+    [[ -f "$S/fail_rollback" ]] && { echo "cannot rollback" >&2; exit 1; }
+    grep -qxF "$2" "$S/snapshots" || exit 1
+    [[ "$(cat "$S/status")" == stopped ]] || echo "zfs rollback while the CT was running" >> "$S/unhandled"
+    rm -rf "$S/fs"; cp -r "$S/snap" "$S/fs"
+    ;;
+  destroy)
+    grep -vxF "$2" "$S/snapshots" > "$S/snapshots.tmp"; mv "$S/snapshots.tmp" "$S/snapshots"
+    ;;
+  *) echo "zfs $*" >> "$S/unhandled"; exit 99 ;;
+esac

@@ -42,8 +42,8 @@ the signature against a public key pinned inside the running script, shows a dif
 and asks for confirmation, then does an atomic in-place replace. It **fails
 closed**: a missing/invalid signature, the wrong key, a missing pinned key, or a
 failed syntax check all abort without touching the installed file. Downloads are
-HTTPS-only (no protocol downgrade). The systemd timer runs skip the check
-entirely, so scheduled updates never depend on the network.
+HTTPS-only (no protocol downgrade). Runs whose output isn't a terminal (piped or
+logged) skip the check entirely.
 
 Because the trusted key lives in the *currently-running* script, a malicious push
 to the GitHub repo cannot rotate it — an attacker would need your private signing
@@ -105,16 +105,23 @@ surfaces later as a rejected `--self-update` on someone else's machine. Set
 ./pve-update.sh --host-only --apply   # PVE host only
 ./pve-update.sh --apt-only --apply    # OS packages only (skip community scripts + Docker)
 ./pve-update.sh --apply --no-host     # All CTs, skip PVE host
-./pve-update.sh --apply -y            # Apply without the confirm prompt
+./pve-update.sh --apply -y            # Apply without the confirm prompt (needed without a terminal)
 ./pve-update.sh --apply --exclude 129,130  # Leave CTs 129 and 130 alone
 ./pve-update.sh --self-update         # Update this script from GitHub
 ```
 
-When you run `--apply` in a terminal, the script first previews what's available
-(a check pass over the same targets) and asks **`Apply these updates now? [y/N]`**
-before changing anything — answer `n` and nothing is touched. Pass `-y` to skip
-the prompt. The systemd timer runs with no terminal, so it always applies
-unattended (the prompt is skipped automatically).
+`--apply` works in two steps over the same targets. First it checks everything,
+printing the same report a check run does, and then it applies only what that
+check found. The apply doesn't repeat the checks, and containers with nothing to
+do are left alone. It still goes to the network where applying needs it: Docker
+pulls the queued images, and `apk upgrade` refetches its indexes. Between the two
+steps it asks **`▶▶ ARM UPDATE SEQUENCE? [Y/N]`** (only `y` or `Y` proceeds). Answer `n` and nothing is
+touched. If the check finds nothing to apply, it says so and exits without
+asking. Pass `-y` to skip the prompt. Without a terminal to ask on (plain `ssh`
+without `-t`, a pipe, cron), `--apply` refuses to run unless you pass `-y`.
+Interrupting the apply step (Ctrl-C) doesn't cut off a container mid-update: the
+script waits for the ones already running, then prints the status board marked
+`INTERRUPTED` and sends the failure push as usual, and exits 130.
 
 Containers are processed in parallel, and each container's report prints as soon
 as that container finishes, so one slow container doesn't hold back the rest. In
@@ -126,21 +133,14 @@ Some containers mustn't be restarted at an arbitrary moment, for example one tha
 recording a live session. There are two ways to protect them:
 
 **Exclude it outright.** `--exclude 129,130` (or `--exclude=129`) skips those CTs
-entirely, even when they're also named as targets. The timer has no command line to
-add it to, so set it with a systemd drop-in instead. This survives `--install-timer`,
-which rewrites the unit file:
-
-```bash
-systemctl edit pve-update.service
-# [Service]
-# Environment=PVE_UPDATE_EXCLUDE=129,130
-```
+entirely, even when they're also named as targets.
 
 **Defer it only while it's busy.** Put an executable at `/etc/pve-updater/hooks/<ctid>`
-on the PVE host. Before `--apply` touches that CT, the script runs the hook with the CT
+on the PVE host. Before `--apply` changes anything in that CT (after the prompt, and
+only when the check found something to do there), the script runs the hook with the CT
 ID as `$1`. Exit 0 means go ahead. Any other exit, or no answer within 60 s, skips the
 whole CT for this run (no apt, community script or Docker), and the summary lists it
-under *Skipped*. The next run asks again. Check runs never call the hook. For example:
+under *SKIPPED — NEEDS ACTION*. The next run asks again. Check runs never call the hook. For example:
 
 ```bash
 #!/bin/sh
@@ -159,74 +159,58 @@ ssh -t root@pve ./pve-update.sh --apply
 ```
 
 Without `-t`, `ssh` gives the script no terminal. You lose colors and the live
-status line, and **`--apply` skips the confirm prompt and applies straight away**,
-the same as the unattended timer. The script prints a warning when it detects this.
+status line, and **`--apply` refuses to run** because there is nowhere to ask for
+confirmation (add `-y` if you really mean to apply without one). Otherwise the
+script prints a warning when it detects this.
 
-## Automatic updates (systemd timer)
-
-```bash
-sudo ./pve-update.sh --install-timer          # Install weekly timer (default)
-sudo ./pve-update.sh --install-timer daily    # Install daily timer
-```
-
-View logs after a scheduled run:
-
-```bash
-journalctl -u pve-update.service
-```
-
-A run that had a failure (host dist-upgrade, apt, a community script, a Docker recreate)
-exits non-zero, so the unit shows up in `systemctl --failed`.
+A run that had a failure (host dist-upgrade, apt/apk, a community script, a Docker recreate)
+exits non-zero.
 
 ### Notifications (ntfy)
 
-To get a push when a run needs you, create `/etc/default/pve-update` (mode 600):
+To get a push when something in an `--apply` run fails, create `/etc/default/pve-update`
+(mode 600):
 
 ```bash
 PVE_UPDATE_NTFY=https://ntfy.example.com/homelab-updates
 PVE_UPDATE_NTFY_TOKEN=tk_...        # optional, for a protected topic
 ```
 
-The file is read as plain `KEY=value` data (never sourced, only these two keys), by timer
-and manual `--apply` runs alike; a value set in the environment (a systemd drop-in) wins.
-Each run sends at most one message, and only when something needs a person:
+The file is read as plain `KEY=value` data (never sourced, only these two keys); a value
+already set in the environment wins. Each run sends at most one message, and only when
+something failed:
 
 | Priority | When |
 |---|---|
-| 5 | A community script failed and something may still be down: the rollback failed, or what the script stopped isn't running again (always checked, rollback or not) |
-| 4 | Something failed but nothing is left down: a community script failed and was rolled back, or the host, apt or a Docker recreate failed |
-| 3 | Only `Skipped (needs action)` items: low disk, OS mismatch, the major-version guard |
+| 5 | A community script failed and something may still be down: the rollback failed (the snapshot is kept), or what the script stopped isn't running again (always checked, rollback or not) |
+| 4 | Something failed but nothing is left down: a community script failed and was rolled back, or the host dist-upgrade, apt/apk or a Docker recreate failed |
 
-A clean run sends nothing, nor does a CT deferred by its hook. Check runs never push. The
-token goes to `curl` on stdin, so it doesn't appear in the process list.
-
-Remove the timer:
-
-```bash
-systemctl disable --now pve-update.timer
-rm /etc/systemd/system/pve-update.{service,timer}
-```
+Skips and holds (low disk, OS mismatch, the major-version guard, a CT deferred by its hook)
+don't push; they're listed on the status board under *SKIPPED — NEEDS ACTION*. A clean run
+sends nothing, and check runs never push. The status board's `NTFY` line says whether the
+push went out. The token goes to `curl` on stdin, so it doesn't appear in the process list.
 
 ## Notes
 
-- **When Docker containers get recreated**: on `--apply`, a container is recreated only when its image ID differs from the ID its tag points at after the pull. Only that container's compose service is recreated (`docker compose up -d --no-deps <service>`); other services in the same file are left alone. A locally built image is skipped: on the classic image store it has no registry digest and isn't pulled at all, and on the containerd store its pull fails. A failed pull, such as an auth error, a missing repo or Docker Hub's 429, is reported under `Images not checked`. No failed or skipped pull restarts anything. A container not managed by a compose file is reported, not recreated
-- **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first. The summary counts them separately (`Images pinned (manual bump)`) from images the script actually updated, because only the pinned ones need you to edit a file
-- **Check mode and Docker**: a `--check` run asks each unpinned image's registry whether the tag still resolves to the image you're running, so its count matches what `--apply` would do. It's read-only — no layers are downloaded and no container is recreated. If a registry can't be reached (private repo needing auth, locally-built image, or Docker Hub's anonymous rate limit — a sweep of many containers can trip its 429) the image is reported as not checked rather than guessed at, and a `Images not checked` line appears in the summary so a `0` above it is never mistaken for all-clear. Running `docker login` inside the container raises the Hub limit
+- **When Docker containers get recreated**: on `--apply`, a container is recreated only when its image ID differs from the ID its tag points at after the pull. Only that container's compose service is recreated (`docker compose up -d --no-deps <service>`); other services in the same file are left alone. A locally built image is skipped: on the classic image store it has no registry digest and isn't pulled at all, and on the containerd store its pull fails. A failed pull, such as an auth error, a missing repo or Docker Hub's 429, is counted under `UNCHECKED` on the status board. No failed or skipped pull restarts anything. A container not managed by a compose file is reported, not recreated
+- **Docker pinned tags** (e.g. `nginx:1.25.3`) are reported but never auto-updated — change the tag in your compose file first. The status board counts them separately (`PIN`) from images the script actually updated (`IMG`), because only the pinned ones need you to edit a file
+- **Check mode and Docker**: a `--check` run asks each unpinned image's registry whether the tag still resolves to the image you're running, so its count matches what `--apply` would do. It also compares the image each container runs with the one its tag points at locally: a container still on an older image than its local tag (after a manual pull, or an earlier recreate that failed) counts as an update, and `--apply` pulls the tag and recreates the container if the pull succeeds. It's read-only — no layers are downloaded and no container is recreated. If a registry can't be reached (private repo needing auth, locally-built image, or Docker Hub's anonymous rate limit — a sweep of many containers can trip its 429) the image is reported as not checked rather than guessed at, and an `UNCHECKED` counter appears on the status board so `IMG 0` is never mistaken for all-clear. Running `docker login` inside the container raises the Hub limit
 - **Reboots** are never triggered automatically — the script flags when one is needed and which kernel to boot into
-- **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set only on containers where `dpkg -s homebridge` confirms the package is installed, so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block unattended upgrades. Other containers are left alone
+- **Homebridge** containers: `UPDATE_HOMEBRIDGE_FORCE=1` is set only on containers where `dpkg -s homebridge` confirms the package is installed, so the homebridge package's "must not be upgraded from the UI Terminal" guard doesn't block non-interactive upgrades. Other containers are left alone
 - **Low disk space**: if a community script aborts itself because the container is low on disk, that's reported as a **skip** (not a failure) — free space (e.g. `pct resize <id> rootfs +2G`) and re-run
 - **Community scripts** are written to a temp file before execution to prevent shell injection from script content
-- **Failed community-script updates are rolled back**: a community script stops the app, replaces its files and records the new version in `/root/.<app>` *before* it builds, so a failure part-way (a build killed by the CT's memory limit, a timeout) leaves the app down, and every later run sees "no update available". So before running one, `--apply` takes a ZFS snapshot of the CT's root disk (`<dataset>@pve-update-<run>`). If the script fails, the script first saves the evidence to `/var/log/pve-update/<run>-ct<id>-<app>/` on the host (full script output, the CT's `/tmp/create-lxc-*` logs, its journal since the update began, the services it stopped, and any kernel OOM kill in that CT), then stops the CT, rolls the root disk back, starts it, and waits up to a minute for what the script stopped to run again. The app comes back on its previous version, and the next run tries the update again. The snapshot is removed after a successful update, a skip, or a successful rollback, and kept if the rollback fails. Only the root disk is snapshotted: mount points (data volumes, bind-mounted shares) are never rolled back, and anything the CT wrote to its root disk during the update is lost (the app was already stopped). A root disk that isn't a ZFS subvol can't be rolled back; the failure is still logged and reported. Low-disk and OS-mismatch refusals aren't failures and don't roll back
-- **\*arr app versions**: for each app at `/var/lib/<app>/config.xml`, both modes ask the app's own API (on the CT's loopback, with the key from `config.xml`, which never leaves the CT and is never printed) what it runs and which builds its updater offers, and print `running → newest`. This only reports; nothing is updated through the API. It also says what keeps the app current: its built-in updater (when *Automatic* is on), the community script, or nothing. The *arr apps install no updates on their own on Linux unless *Automatic* is turned on in Settings → General → Updates, so an app with that off and no community script is listed under `No automatic app updates`. The update list comes from servarr.com; if that can't be reached, or the CT has no `curl`, the app is counted under `*arr apps not checked`. After `--apply` runs a community script, its apps are checked again (retrying for up to a minute while the app restarts) so the summary reflects the update. The `*arr` summary lines only appear on hosts that run an *arr app
-- **Major-version guard**: before running a community script for an *arr app, the script compares the version that app last ran with the one the community script last installed (`/root/.<app>`). "Last ran" is the higher of what the API reports and the app's most recent `Starting … Version X` log line, so it still works while the app is down. If that's a newer major (moved by hand, or by the app's own updater onto a release the script doesn't track, such as Sonarr v5 against a script pinned to v4), the community script is **skipped** and listed under `Skipped (needs action)`, in check mode too. Running it would put the older major over a database that was already migrated forward, which can't be undone. Update the app with its own updater, and remove `/usr/bin/update` from the CT if the script no longer applies. The guard fails closed: the script is also skipped when neither the API nor the log gives a version, when the app the script names has no `/root/.<app>`, or when the app check couldn't run in the CT at all. If the `/usr/bin/update` entrypoint doesn't say which app it's for, every app with a marker is guarded
+- **Failed community-script updates are rolled back**: a community script stops the app, replaces its files and records the new version in `/root/.<app>` *before* it builds, so a failure part-way (a build killed by the CT's memory limit, a timeout) leaves the app down, and every later run sees "no update available". So right before running one, the apply step takes a ZFS snapshot of the CT's root disk (`<dataset>@pve-update-<run>`; the check step only looks up which dataset that is). If the script fails, the script first saves the evidence to `/var/log/pve-update/<run>-ct<id>-<app>/` on the host (full script output, the CT's `/tmp/create-lxc-*` logs, its journal since the update began, the services it stopped, and any kernel OOM kill in that CT), then stops the CT, rolls the root disk back, starts it, and waits up to a minute for what the script stopped to run again. The CT's card shows this on `SNAP` and `RBK` lines. The app comes back on its previous version, and the next run tries the update again. The snapshot is removed after a successful update, a skip, or a successful rollback, and kept if the rollback fails. Only the root disk is snapshotted: mount points (data volumes, bind-mounted shares) are never rolled back, and anything the CT wrote to its root disk during the update is lost (the app was already stopped). A root disk that isn't a ZFS subvol can't be rolled back; the failure is still logged and reported. Low-disk and OS-mismatch refusals aren't failures and don't roll back
+- **\*arr app versions**: for each app at `/var/lib/<app>/config.xml`, both modes ask the app's own API (on the CT's loopback, with the key from `config.xml`, which never leaves the CT and is never printed) what it runs and which builds its updater offers, and print `running ━▶ newest`. This only reports; nothing is updated through the API. It also says what keeps the app current: its built-in updater (when *Automatic* is on), the community script, or nothing. The *arr apps install no updates on their own on Linux unless *Automatic* is turned on in Settings → General → Updates, so an app with that off and no community script is listed under `NO AUTOMATIC APP UPDATES`. The update list comes from servarr.com; if that can't be reached, or the CT has no `curl`, the app is counted under `ARR UNCHECKED`. After `--apply` runs a community script, its apps are checked again (retrying for up to a minute while the app restarts) so the summary reflects the update. The `ARR` counters on the status board only appear on hosts that run an *arr app
+- **Major-version guard**: before running a community script for an *arr app, the script compares the version that app last ran with the one the community script last installed (`/root/.<app>`). "Last ran" is the higher of what the API reports and the app's most recent `Starting … Version X` log line, so it still works while the app is down. If that's a newer major (moved by hand, or by the app's own updater onto a release the script doesn't track, such as Sonarr v5 against a script pinned to v4), the community script is **skipped** and listed under `SKIPPED — NEEDS ACTION`, in check mode too. Running it would put the older major over a database that was already migrated forward, which can't be undone. Update the app with its own updater, and remove `/usr/bin/update` from the CT if the script no longer applies. The guard fails closed: the script is also skipped when neither the API nor the log gives a version, or when the app check couldn't run in the CT at all. An app with no `/root/.<app>` is different: there is nothing to compare against, and holding the script back would never clear (the script is what writes the marker, and the Readarr and Whisparr scripts never write one), so the script runs and the CT card shows a `GUARD NOT APPLIED` warning instead. The tradeoff: a script that succeeds is never rolled back, so an app without a marker has no downgrade protection. If the `/usr/bin/update` entrypoint doesn't say which app it's for, every app with a marker is guarded
 
 ## Tests
 
-`tests/run-tests.sh` runs `--apply` against one fake CT to check the community-script rollback,
-the failure log and the ntfy push. `pct`, `zfs`, `pvesm`, `curl` and `journalctl` are test doubles,
-and `PATH` holds only those plus `/usr/bin:/bin`, so the real `pct`/`zfs`/`pvesm` (in `/usr/sbin`)
-can't be reached and nothing on the host or in a real CT is touched. The script insists on root,
-so run it as root on the PVE host or any Linux box with bash 4+:
+`tests/run-tests.sh` runs the script against one fake CT: the community-script rollback, the
+failure log and the ntfy push, plus the two-step apply (the no-terminal refusal, nothing to
+apply, an untouched CT, a hook deferral). `pct`, `zfs`, `pvesm`, `curl` and `journalctl` are
+test doubles, and `PATH` holds only those plus `/usr/bin:/bin`, so the real `pct`/`zfs`/`pvesm`
+(in `/usr/sbin`) can't be reached and nothing on the host or in a real CT is touched. The script
+insists on root, so run it as root on the PVE host or any Linux box with bash 4+:
 
 ```bash
 sudo bash tests/run-tests.sh      # KEEP=1 keeps a failing scenario's state dir

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/run-tests.sh — scenario tests for the community-script rollback path
+# tests/run-tests.sh — scenario tests for the apply step and its rollback path
 # =============================================================================
-# Runs pve-update.sh --apply against one fake CT. pct, zfs, pvesm, curl and
+# Runs pve-update.sh --apply against one fake CT (and, in some scenarios, a
+# second idle one). pct, zfs, pvesm, curl and
 # journalctl are test doubles (tests/fakes/), and PATH holds only those plus
 # /usr/bin:/bin, so the real pct/zfs/pvesm in /usr/sbin can't be reached and
 # apt-get/systemctl/qm are tripwires. Nothing on the host or in any real CT is
@@ -26,7 +27,7 @@ setup() {
   echo "/VM-Pool/subvol-$CT-disk-0" > "$S/pvesm_path"
   echo "/VM-Pool/subvol-$CT-disk-0" > "$S/zfs_path"
   echo "VM-Pool/subvol-$CT-disk-0" > "$S/zfs_ds"
-  mkdir -p "$S/fs" "$S/logs"
+  mkdir -p "$S/fs" "$S/logs" "$S/hooks"
   printf 'cron.service\nprofilarr.service\n' > "$S/fs/enabled"
   : > "$S/fs/broken"
   cp "$S/fs/enabled" "$S/running"
@@ -35,12 +36,45 @@ setup() {
   printf 'PVE_UPDATE_NTFY=https://ntfy.example/homelab-updates\nPVE_UPDATE_NTFY_TOKEN=tk_secret123\n' > "$S/config"
 }
 
-# Run the script. Output in $S/out, exit code in $RC.
+# Run the script, by default '--apply -y --no-update-check <CT>' (stdin is
+# never a terminal here, so --apply needs -y). Other arguments replace those.
+# Output in $S/out, exit code in $RC. FAKE_CT2 (if set) adds the idle CT.
 run() {
+  local args=("$@")
+  [[ ${#args[@]} -gt 0 ]] || args=(--apply -y --no-update-check "$CT")
   env -i HOME=/root PATH="$FAKES:/usr/bin:/bin" FAKE_STATE="$S" FAKE_CT="$CT" \
-    PVE_UPDATE_CONFIG="$S/config" PVE_UPDATE_LOG_DIR="$S/logs" \
-    bash "$SCRIPT" --apply -y --no-update-check "$CT" </dev/null > "$S/out" 2>&1
+    FAKE_CT2="${FAKE_CT2:-}" PVE_UPDATE_CONFIG="$S/config" PVE_UPDATE_LOG_DIR="$S/logs" \
+    PVE_UPDATE_HOOK_DIR="$S/hooks" \
+    bash "$SCRIPT" "${args[@]}" </dev/null > "$S/out" 2>&1
   RC=$?
+}
+
+# Run the default apply in the background, wait until the fake community
+# script is running (cs_wait), send signal $1 to the script, then let the
+# community script finish. Output in $S/out, exit code in $RC. A script's
+# background jobs start with SIGINT ignored, and an ignored signal can't be
+# trapped, so perl puts the default back before it runs pve-update.sh.
+run_signal() {
+  local pid i
+  touch "$S/cs_wait"
+  perl -e '$SIG{INT} = "DEFAULT"; exec @ARGV' \
+    env -i HOME=/root PATH="$FAKES:/usr/bin:/bin" FAKE_STATE="$S" FAKE_CT="$CT" \
+    PVE_UPDATE_CONFIG="$S/config" PVE_UPDATE_LOG_DIR="$S/logs" PVE_UPDATE_HOOK_DIR="$S/hooks" \
+    bash "$SCRIPT" --apply -y --no-update-check "$CT" </dev/null > "$S/out" 2>&1 &
+  pid=$!
+  i=0
+  while [[ ! -e "$S/cs_started" ]] && (( i++ < 300 )); do /usr/bin/sleep 0.1; done
+  kill -s "$1" "$pid"
+  /usr/bin/sleep 0.5      # the script is now waiting on its job
+  touch "$S/cs_go"
+  wait "$pid"; RC=$?
+}
+
+# A busy hook for CT $1 that records its call and exits $2.
+hook() {
+  # shellcheck disable=SC2016  # $1 is the hook's own argument
+  printf '#!/bin/sh\necho "hook $1" >> "%s/calls.log"\nexit %s\n' "$S" "$2" > "$S/hooks/$1"
+  chmod +x "$S/hooks/$1"
 }
 
 _t=""
@@ -68,9 +102,13 @@ end() {
 
 # --- 1. Success: snapshot taken, then removed; nothing pushed ----------------
 begin "success removes the pre-update snapshot and stays quiet"
+hook "$CT" 0
 run
 check "exit 0"                      equals "$RC" 0
 check "snapshot was taken"          has "$S/calls.log" "^zfs snapshot VM-Pool/subvol-$CT-disk-0@pve-update-"
+check "hook, then snapshot, then script" equals \
+  "$(awk -v ct="$CT" '$0 == "hook " ct {print "hook"} /^zfs snapshot / {print "snapshot"} /bash \/tmp\/\.pve_update_/ {print "script"}' "$S/calls.log" | paste -sd'|' -)" \
+  "hook|snapshot|script"
 check "snapshot is gone"            empty "$S/snapshots"
 check "no rollback"                 hasnt "$S/calls.log" "^zfs rollback"
 check "no push"                     missing "$S/curl.args"
@@ -140,15 +178,16 @@ check "rolled back"                 has "$S/calls.log" "^zfs rollback"
 check "no push"                     missing "$S/curl.args"
 end
 
-# --- 6. Low-disk skip: not a failure, no rollback, P3 ------------------------
-begin "low-disk skip: no rollback, snapshot removed, P3 push"
+# --- 6. Low-disk skip: not a failure, no rollback, no push ------------------
+begin "low-disk skip: no rollback, snapshot removed, no push"
 echo lowdisk > "$S/cs_mode"
 run
 check "exit 0"                      equals "$RC" 0
+check "snapshot was taken"          has "$S/calls.log" "^zfs snapshot "
 check "no rollback"                 hasnt "$S/calls.log" "^zfs rollback"
 check "snapshot removed"            empty "$S/snapshots"
-check "push is P3"                  has "$S/curl.args" "^Priority: 3$"
-check "push names the skip"         has "$S/curl.body" "low disk space"
+check "skips don't push"            missing "$S/curl.args"
+check "board lists the skip"        has "$S/out" "$CT \(profilarr\): low disk space"
 end
 
 # --- 7. Config is parsed, never executed -------------------------------------
@@ -158,6 +197,168 @@ echo fail > "$S/cs_mode"
 run
 check "command substitution not run" missing "$S/pwned"
 check "quotes stripped from token"  has "$S/curl.stdin" "Bearer tk_quoted\"$"
+end
+
+# --- 8. No terminal and no -y: refused before anything runs -----------------
+begin "--apply without a terminal or -y refuses before touching anything"
+run --apply --no-update-check "$CT"
+check "exit 1"                      equals "$RC" 1
+check "says why"                    has "$S/out" "no terminal to confirm on"
+check "no pct call at all"          hasnt "$S/calls.log" "^pct "
+check "no zfs call"                 hasnt "$S/calls.log" "^zfs "
+end
+
+# --- 9. Nothing to apply: the check runs, the apply step never does ----------
+begin "nothing to apply: exits after the check without acting"
+touch "$S/no_cs"; hook "$CT" 0
+run
+check "exit 0"                      equals "$RC" 0
+check "says so"                     has "$S/out" "NOTHING TO APPLY"
+check "the CT was checked"          has "$S/calls.log" "^pct exec $CT -- cat /usr/bin/update"
+check "hook not called"             hasnt "$S/calls.log" "^hook "
+check "no snapshot"                 hasnt "$S/calls.log" "^zfs snapshot"
+check "no apply step"               hasnt "$S/out" "EXECUTING UPDATE SEQUENCE"
+end
+
+# --- 10. A CT the check found nothing in is left alone by the apply ----------
+begin "an idle CT is checked but never touched by the apply step"
+FAKE_CT2=9105; hook "$CT" 0; hook 9105 0
+run --apply -y --no-update-check "$CT" 9105
+check "exit 0"                      equals "$RC" 0
+check "idle CT was checked"         has "$S/calls.log" "^pct exec 9105 -- cat /usr/bin/update"
+check "busy CT was updated"         has "$S/calls.log" "bash /tmp/\.pve_update_"
+check "busy CT's hook ran"          has "$S/calls.log" "^hook $CT$"
+check "idle CT's hook never ran"    hasnt "$S/calls.log" "^hook 9105$"
+check "idle CT never snapshotted"   hasnt "$S/calls.log" "^zfs snapshot .*9105"
+check "no apply card for it"        hasnt "$S/out" "DECK 9105\]─\[IDLE\]─\[EXECUTE"
+FAKE_CT2=""
+end
+
+# --- 11. Hook defers the CT after the check ----------------------------------
+begin "hook deferral: checked first, then deferred untouched, no push"
+hook "$CT" 1
+run
+check "exit 0"                      equals "$RC" 0
+check "checked before the hook"     equals "$(grep -nE '^(pct exec '"$CT"' -- cat /usr/bin/update|hook '"$CT"')$' "$S/calls.log" | cut -d: -f2- | paste -sd'|' -)" "pct exec $CT -- cat /usr/bin/update|hook $CT"
+check "shows DEFERRED"              has "$S/out" "DEFERRED"
+check "no snapshot"                 hasnt "$S/calls.log" "^zfs snapshot"
+check "community script not run"    hasnt "$S/calls.log" "bash /tmp/\.pve_update_"
+check "listed as a skip"            has "$S/out" "deferred by hook \(exit 1\)"
+check "no push"                     missing "$S/curl.args"
+end
+
+# --- 12. apt upgrade fails: FAULT with apt's exit code, exit 1, P4 push ------
+begin "failed apt upgrade: FAULT with its exit code, exit 1, P4 push"
+touch "$S/apt_pending" "$S/apt_fail"
+run
+check "exit 1"                      equals "$RC" 1
+check "FAULT with apt's exit code"  has "$S/out" "FAULT — apt upgrade failed \(exit 3\)"
+check "board says what failed"     has "$S/out" "✖ $CT \(profilarr\): apt upgrade failed \(exit 3\)$"
+check "push is P4"                  has "$S/curl.args" "^Priority: 4$"
+check "push says what failed"      has "$S/curl.body" "^FAILED $CT \(profilarr\): apt upgrade failed \(exit 3\)$"
+check "never a bare FAILED line"    hasnt "$S/curl.body" "^FAILED $CT \(profilarr\)$"
+end
+
+# --- 13. CT stopped while the prompt waited: left alone, a skip -------------
+begin "CT stopped between the check and the apply is left alone"
+# The hook stands in for whoever stops it: it runs after the check, right
+# before the apply step looks at the CT.
+# shellcheck disable=SC2016  # $1 is the hook's own argument
+printf '#!/bin/sh\necho "hook $1" >> "%s/calls.log"\necho stopped > "%s/status"\n' "$S" "$S" > "$S/hooks/$CT"
+chmod +x "$S/hooks/$CT"; touch "$S/apt_pending"
+run
+check "exit 0"                      equals "$RC" 0
+check "says so"                     has "$S/out" "STOPPED SINCE SCAN"
+check "no snapshot"                 hasnt "$S/calls.log" "^zfs snapshot"
+check "no rollback"                 hasnt "$S/calls.log" "^zfs rollback"
+check "not started"                 hasnt "$S/calls.log" "^pct start"
+check "no apt upgrade"              hasnt "$S/calls.log" "apt-get upgrade -y"
+check "script not run"              hasnt "$S/calls.log" "bash /tmp/\.pve_update_"
+check "still stopped"               equals "$(cat "$S/status")" stopped
+check "listed as a skip"            has "$S/out" "$CT \(profilarr\): stopped since the check"
+check "no push"                     missing "$S/curl.args"
+end
+
+# --- 14. CT stopped while its script ran: rolled back, not started ----------
+begin "CT stopped during a failing script is rolled back but left stopped"
+echo failstop > "$S/cs_mode"
+run
+check "exit 1"                      equals "$RC" 1
+check "rolled back"                 has "$S/calls.log" "^zfs rollback"
+check "not started"                 hasnt "$S/calls.log" "^pct start"
+check "still stopped"               equals "$(cat "$S/status")" stopped
+check "push is P5"                  has "$S/curl.args" "^Priority: 5$"
+check "push says it was left stopped" has "$S/curl.body" "left stopped"
+end
+
+# --- 15. Guard-held script: apt still applies, nothing else ------------------
+begin "guard-held community script: apt applies, no snapshot, no script, no push"
+echo sonarr > "$S/cs_slug"; touch "$S/apt_pending"
+echo "sonarr|5.0.1.100|develop|builtin|True|4.0.15.2941|5.0.1.100||" > "$S/arr"
+run
+check "exit 0"                      equals "$RC" 0
+check "held in the check"           has "$S/out" "WITHHELD"
+check "apt applied"                 has "$S/calls.log" "apt-get upgrade -y"
+check "no zfs call at all"          hasnt "$S/calls.log" "^zfs "
+check "script not run"              hasnt "$S/calls.log" "bash /tmp/\.pve_update_"
+check "listed as a skip"            has "$S/out" "sonarr has run 5\.0\.1\.100, a newer major"
+check "no push"                     missing "$S/curl.args"
+end
+
+# --- 16. --apt-only --apply: packages only ----------------------------------
+begin "--apt-only --apply upgrades packages and nothing else"
+touch "$S/apt_pending"
+run --apply -y --apt-only --no-update-check "$CT"
+check "exit 0"                      equals "$RC" 0
+check "apt applied"                 has "$S/calls.log" "apt-get upgrade -y"
+check "no zfs call at all"          hasnt "$S/calls.log" "^zfs "
+check "script not run"              hasnt "$S/calls.log" "bash /tmp/\.pve_update_"
+end
+
+# --- 17. The CT won't stop: no rollback, no start, snapshot kept, P5 ---------
+begin "CT that won't stop: no rollback, snapshot kept, P5"
+echo fail > "$S/cs_mode"; touch "$S/fail_stop"
+run
+check "exit 1"                      equals "$RC" 1
+check "no rollback"                 hasnt "$S/calls.log" "^zfs rollback"
+check "not started"                 hasnt "$S/calls.log" "^pct start"
+check "snapshot kept"               has "$S/snapshots" "@pve-update-"
+check "push is P5"                  has "$S/curl.args" "^Priority: 5$"
+check "push says snapshot kept"     has "$S/curl.body" "snapshot kept"
+end
+
+# --- 18. Rolled back, but the CT won't start: P5, snapshot gone -------------
+begin "rolled back but the CT stays down: P5, snapshot destroyed"
+echo fail > "$S/cs_mode"; touch "$S/fail_start"
+run
+check "exit 1"                      equals "$RC" 1
+check "rolled back"                 has "$S/calls.log" "^zfs rollback"
+check "snapshot destroyed"          empty "$S/snapshots"
+check "push is P5"                  has "$S/curl.args" "^Priority: 5$"
+check "push says it didn't start"   has "$S/curl.body" "didn't start"
+end
+
+# --- 19. Ctrl-C while a script fails and can't roll back --------------------
+begin "Ctrl-C mid-apply: waits for the job, reports INTERRUPTED, pushes P5, exits 130"
+echo fail > "$S/cs_mode"; touch "$S/fail_rollback"
+run_signal INT
+check "exit 130"                    equals "$RC" 130
+check "said it was waiting"         has "$S/out" "HOLDING — WAITING FOR 1 CT"
+check "the job finished"            has "$S/out" "ROLLBACK FAILED"
+check "board marked interrupted"    has "$S/out" "STATUS BOARD // AFTER ACTION — INTERRUPTED"
+check "failure on the board"        has "$S/out" "✖ $CT \(profilarr\): community script failed"
+check "push is P5"                  has "$S/curl.args" "^Priority: 5$"
+check "push says snapshot kept"     has "$S/curl.body" "snapshot kept"
+end
+
+# --- 20. kill while a script succeeds: report, no push ------------------------
+begin "kill mid-apply on a good update: reports INTERRUPTED, no push, exits 143"
+run_signal TERM
+check "exit 143"                    equals "$RC" 143
+check "the job finished"            has "$S/out" "COMPLETE — community script update"
+check "snapshot removed"            empty "$S/snapshots"
+check "board marked interrupted"    has "$S/out" "STATUS BOARD // AFTER ACTION — INTERRUPTED"
+check "no push"                     missing "$S/curl.args"
 end
 
 echo ""

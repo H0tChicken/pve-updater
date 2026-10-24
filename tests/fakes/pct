@@ -5,19 +5,55 @@
 #   running           services running right now, one per line
 #   fs/enabled        services that start with the CT
 #   fs/broken         services whose files are gone, so they won't start
-#   cs_mode           what the community script does: ok | fail | lowdisk
+#   cs_mode           what the community script does: ok | fail | lowdisk |
+#                     failstop (fails like 'fail', and the CT ends up stopped)
+#   cs_slug           the app /usr/bin/update names (default profilarr)
+#   cs_wait           (exists) the script touches cs_started, then waits for
+#                     cs_go (at most 30s) before doing what cs_mode says
+#   arr               lines the *arr check prints for this CT (default none)
+#   no_cs             (exists) the CT has no /usr/bin/update
+#   apt_pending       (exists) apt has one upgrade pending
+#   apt_fail          (exists) that upgrade fails with exit 3
+# $FAKE_CT2, when set, is a second CT with nothing to update: it answers the
+# check's questions, and anything else run in it is 'unhandled', so a test
+# notices if the apply step touches it.
 # fs/ is the CT's root disk: the fake zfs snapshots and rolls back that dir.
 # Any call this fake doesn't recognise is recorded in 'unhandled' and fails,
 # so a test notices when the script does something nobody modelled.
+# shellcheck disable=SC2153  # FAKE_CT comes from run-tests.sh, like FAKE_CT2
 S="$FAKE_STATE"
 echo "pct $*" >> "$S/calls.log"
 unhandled() { echo "pct $*" >> "$S/unhandled"; exit 99; }
 
 cmd="$1"; shift
+if [[ -n "${FAKE_CT2:-}" && "${1:-}" == "$FAKE_CT2" ]]; then
+  case "$cmd" in
+    status) echo "status: running" ;;
+    config) printf 'hostname: idle\nrootfs: VM-Pool:subvol-%s-disk-0,size=8G\n' "$FAKE_CT2" ;;
+    exec)
+      shift; [[ "$1" == "--" ]] && shift
+      line="$*"
+      case "$line" in
+        *"/etc/os-release"*)    echo "Debian GNU/Linux 13 (trixie)" ;;
+        *"command -v apk"*)     exit 1 ;;
+        *"command -v apt-get"*) exit 0 ;;
+        *"dpkg -s homebridge"*) echo no ;;
+        *"apt-get update"*)     exit 0 ;;
+        *"apt-get -s upgrade"*) exit 1 ;;
+        "cat /usr/bin/update")  exit 1 ;;
+        *"#done"*)              echo "#done" ;;
+        *"command -v docker"*)  echo no ;;
+        *) unhandled exec "$FAKE_CT2" "$line" ;;
+      esac ;;
+    *) unhandled "$cmd" "$@" ;;
+  esac
+  exit 0
+fi
 case "$cmd" in
   list)
     printf 'VMID       Status     Lock         Name\n'
     printf '%-10s %-10s %-12s %s\n' "$FAKE_CT" "$(cat "$S/status")" "" profilarr
+    [[ -n "${FAKE_CT2:-}" ]] && printf '%-10s %-10s %-12s %s\n' "$FAKE_CT2" running "" idle
     ;;
   status) echo "status: $(cat "$S/status")" ;;
   config) printf 'hostname: profilarr\nrootfs: %s,size=8G\n' "$(cat "$S/rootfs")" ;;
@@ -41,17 +77,30 @@ case "$cmd" in
       *"command -v apt-get"*)         exit 0 ;;
       *"dpkg -s homebridge"*)         echo no ;;
       *"apt-get update"*)             exit 0 ;;
-      *"apt-get -s upgrade"*)         exit 1 ;;
+      *"apt-get -s upgrade"*)
+        [[ -f "$S/apt_pending" ]] || exit 1
+        echo "Inst libssl3 [3.5.1-1] (3.5.4-1 Debian:13/stable [amd64])" ;;
+      *"apt-get upgrade -y"*)
+        [[ -f "$S/apt_fail" ]] && { echo "E: dpkg was interrupted"; exit 3; }
+        echo "Setting up libssl3 (3.5.4-1)" ;;
       "cat /usr/bin/update")
-        printf '#!/usr/bin/env bash\nexport SCRIPT_SLUG="profilarr"\nexport UPDATE_SCRIPT_NAME="profilarr"\n' ;;
-      *"#done"*)                      echo "#done" ;;
+        [[ -f "$S/no_cs" ]] && exit 1
+        slug=profilarr; [[ -f "$S/cs_slug" ]] && slug=$(cat "$S/cs_slug")
+        printf '#!/usr/bin/env bash\nexport SCRIPT_SLUG="%s"\nexport UPDATE_SCRIPT_NAME="%s"\n' "$slug" "$slug" ;;
+      *"#done"*)                      [[ -f "$S/arr" ]] && cat "$S/arr"; echo "#done" ;;
       *"cat > /tmp/.pve_update_"*)    cat > /dev/null ;;
       *"bash /tmp/.pve_update_"*)
         # stdin is an endless 'yes': never read it.
+        if [[ -f "$S/cs_wait" ]]; then
+          touch "$S/cs_started"
+          i=0
+          while [[ ! -e "$S/cs_go" ]] && (( i++ < 600 )); do sleep 0.05; done
+        fi
         case "$(cat "$S/cs_mode")" in
           ok)      echo "  Updated successfully!"; exit 0 ;;
           lowdisk) echo "  Storage too low in unattended mode"; exit 1 ;;
-          fail)
+          fail|failstop)
+            [[ "$(cat "$S/cs_mode")" == failstop ]] && { echo stopped > "$S/status"; : > "$S/running"; }
             echo "  Stopped Service"
             echo "[ERROR] in line 78: exit code 137 (Killed (SIGKILL / Out of memory?)): while executing command deno run -A npm:vite build"
             grep -vxF profilarr.service "$S/running" > "$S/running.tmp"; mv "$S/running.tmp" "$S/running"
